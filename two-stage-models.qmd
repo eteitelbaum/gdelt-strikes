@@ -1,0 +1,1469 @@
+---
+title: "Two-Stage Refined Pipeline (Calibrated + Threshold by Combined RMSE)"
+format: html
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidymodels)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(bonsai)
+library(finetune)
+library(themis)
+library(janitor)
+library(doFuture)
+library(vip)
+
+tidymodels_prefer()
+conflicted::conflicts_prefer(dplyr::lag)
+conflicted::conflicts_prefer(stringr::fixed)
+conflicted::conflicts_prefer(dials::mixture)
+set.seed(2024)
+
+# Align RNG with single-stage for reproducible parallel jobs
+RNGkind("L'Ecuyer-CMRG")
+
+# Load shared helpers (smearing, metrics utilities)
+source("helpers/helpers.R")
+
+registerDoFuture()
+plan(multisession, workers = 4)
+options(future.globals.maxSize = 8 * 1024^3)
+```
+
+## Load data and features
+
+```{r}
+#| label: data
+
+# Severity selection metric toggle for Stage 2 models
+# Choose either "rmse" or "mae"; affects tuning selection, combined selection, and output filenames
+sev_selection_metric <- "mae"
+
+adm_full <- read_parquet("data/analysis/adm_week_full.parquet") |>
+  clean_names()
+
+# Occurrence target
+adm_full <- adm_full |>
+  mutate(y_occ = factor(if_else(strike_count > 0, "yes", "no"), levels = c("no", "yes")))
+
+# Predictor set (lag/time/spatial)
+predictor_cols <- adm_full |>
+  select(
+    action_geo_adm1_code, action_geo_country_code,
+    time_trend, year_sin, year_cos, month, quarter, is_year_end,
+    strike_count_lag1, strike_count_lag2, strike_count_lag4,
+    rolling_avg_4wk, rolling_avg_8wk,
+    total_articles_lag1, total_articles_lag2,
+    total_mentions_lag1, total_mentions_lag2,
+    avg_tone_lag1, avg_tone_lag2,
+    actor_diversity_lag1,
+    unique_actor1_types_lag1, unique_actor2_types_lag1,
+    prop_gov_lag1, prop_labor_lag1, prop_civil_lag1,
+    country_strikes_lag1, contig_strikes_t1, distw_strikes_t1
+  ) |>
+  names()
+
+model_df <- adm_full |>
+  select(date, strike_count, y_occ, all_of(predictor_cols)) |>
+  arrange(date)
+```
+
+## Rolling-origin splits (3 folds, 26-week assessments)
+
+```{r}
+#| label: splits
+
+all_weeks <- sort(unique(model_df$date))
+test_weeks <- tail(all_weeks, 52)
+
+pretest_df <- model_df |>
+  filter(date < min(test_weeks))
+test_df <- model_df |>
+  filter(date %in% test_weeks)
+
+assessment_weeks <- 26
+n_folds <- 3
+pretest_max <- max(pretest_df$date)
+assess_end_dates <- pretest_max - weeks(rev(seq(0, by = assessment_weeks, length.out = n_folds)))
+assess_start_dates <- assess_end_dates - weeks(assessment_weeks - 1)
+
+# Expanding-window resamples: analysis is all data prior to start_date
+make_time_split <- function(df, start_date, end_date) {
+  analysis_idx <- which(df$date < start_date)
+  assessment_idx <- which(df$date >= start_date & df$date <= end_date)
+  rsample::make_splits(list(analysis = analysis_idx, assessment = assessment_idx), df)
+}
+
+val_splits <- map2(assess_start_dates, assess_end_dates, ~ make_time_split(pretest_df, .x, .y))
+val_resamples <- rsample::manual_rset(val_splits, paste0("fold", seq_along(val_splits)))
+```
+
+## Recipes
+
+```{r}
+#| label: recipes
+
+base_recipe <- recipe(~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.999) |>
+  step_zv(all_predictors())
+
+# Stage 1: occurrence
+occ_recipe <- base_recipe |>
+  update_role(y_occ, new_role = "outcome") |>
+  step_rm(strike_count)
+
+# Stage 2: severity on positives only (two variants)
+sev_recipe_log <- recipe(strike_count ~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_rm(y_occ) |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.999) |>
+  step_zv(all_predictors()) |>
+  step_log(strike_count, offset = 1, skip = TRUE)
+
+sev_recipe_gamma <- recipe(strike_count ~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_rm(y_occ) |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.999) |>
+  step_zv(all_predictors())
+```
+
+## Models and grids
+
+```{r}
+#| label: models
+
+# Metrics
+f_meas2 <- yardstick::metric_tweak("f_meas2", yardstick::f_meas, beta = 2)
+f1_meas <- yardstick::metric_tweak("f1", yardstick::f_meas, beta = 1)
+pr_auc_yes <- yardstick::metric_tweak("pr_auc_yes", yardstick::pr_auc, event_level = "second")
+roc_auc_yes <- yardstick::metric_tweak("roc_auc_yes", yardstick::roc_auc, event_level = "second")
+clf_metrics <- metric_set(pr_auc_yes, roc_auc_yes, f1_meas, f_meas2)
+reg_metrics <- metric_set(rmse, mae, rsq)
+
+# Stage 1 classifiers
+# Baseline GLM (no tuning)
+occ_glm_spec <- logistic_reg() |>
+  set_engine("glm") |>
+  set_mode("classification")
+
+# Regularized GLMNET (tuned)
+occ_glmnet_spec <- logistic_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet") |>
+  set_mode("classification")
+
+# LightGBM classifier (tuned)
+occ_lgbm_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("lightgbm", objective = "binary", num_threads = 1) |>
+  set_mode("classification")
+
+# XGBoost classifier (tuned)
+occ_xgb_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("xgboost", objective = "binary:logistic", tree_method = "hist", nthread = 1) |>
+  set_mode("classification")
+
+# Shared GLMNET grid (reuse)
+grid_glmnet <- grid_regular(
+  penalty(range = c(-5, 0), trans = log10_trans()),
+  mixture(range = c(0, 1)),
+  levels = c(penalty = 10, mixture = 5)  # Named vector: 10 × 5 = 50 configs
+)
+
+# Stage 2: severity (positives only)
+lm_log_spec <- linear_reg() |> set_engine("lm") |> set_mode("regression")
+glmnet_log_spec <- linear_reg(penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+# GBM on log1p(count)
+gbm_sev_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("lightgbm", num_threads = 1) |>
+  set_mode("regression")
+
+# XGBoost on log1p(count)
+xgb_log_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("xgboost", objective = "reg:squarederror", tree_method = "hist", nthread = 1) |>
+  set_mode("regression")
+
+# Gamma(log) severity on positives
+lgb_gamma_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("lightgbm", objective = "gamma", num_threads = 1) |>
+  set_mode("regression")
+
+# XGBoost Gamma severity on positives
+xgb_gamma_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("xgboost", objective = "reg:gamma", tree_method = "hist", nthread = 1) |>
+  set_mode("regression")
+
+# Shared boosted tree grid
+grid_boosted <- grid_space_filling(
+  trees(range = c(200, 600)),
+  tree_depth(range = c(3, 8)),
+  min_n(range = c(2, 20)),
+  loss_reduction(range = c(0, 5)),
+  sample_size = sample_prop(range = c(0.6, 0.9)),
+  mtry(range = c(2, min(12, length(predictor_cols)))),
+  learn_rate(range = c(-3, -1), trans = log10_trans()),
+  size = 24
+)
+```
+
+## Workflows
+
+```{r}
+#| label: workflows
+
+# Build occurrence workflows
+occ_wfs <- list(
+  glm = workflow() |> add_model(occ_glm_spec) |> add_recipe(occ_recipe),
+  glmnet = workflow() |> add_model(occ_glmnet_spec) |> add_recipe(occ_recipe),
+  lgbm = workflow() |> add_model(occ_lgbm_spec) |> add_recipe(occ_recipe),
+  xgb = workflow() |> add_model(occ_xgb_spec) |> add_recipe(occ_recipe)
+)
+
+# Build severity workflows
+sev_wfs <- list(
+  lm_log = workflow() |> add_model(lm_log_spec) |> add_recipe(sev_recipe_log),
+  glmnet_log = workflow() |> add_model(glmnet_log_spec) |> add_recipe(sev_recipe_log),
+  lgbm_log = workflow() |> add_model(gbm_sev_spec) |> add_recipe(sev_recipe_log),
+  xgb_log = workflow() |> add_model(xgb_log_spec) |> add_recipe(sev_recipe_log),
+  gamma_lgbm = workflow() |> add_model(lgb_gamma_spec) |> add_recipe(sev_recipe_gamma),
+  gamma_xgb = workflow() |> add_model(xgb_gamma_spec) |> add_recipe(sev_recipe_gamma)
+)
+
+# Class imbalance weight for boosted classifiers (fixed by pretest prevalence)
+pos_ratio <- mean(pretest_df$y_occ == "yes")
+neg_ratio <- 1 - pos_ratio
+scale_pos_weight <- ifelse(pos_ratio > 0, neg_ratio / pos_ratio, 1)
+
+# Force evaluation and store locally to avoid parallel scoping issues
+spw_value <- scale_pos_weight
+
+# Inject class weight into lightgbm engine
+occ_wfs$lgbm <- occ_wfs$lgbm |>
+  workflows::update_model(
+    parsnip::set_engine(
+      occ_lgbm_spec,
+      engine = "lightgbm",
+      objective = "binary",
+      num_threads = 1,
+      scale_pos_weight = !!spw_value
+    )
+  )
+
+# Inject class weight into xgboost engine
+occ_wfs$xgb <- occ_wfs$xgb |>
+  workflows::update_model(
+    parsnip::set_engine(
+      occ_xgb_spec,
+      engine = "xgboost",
+      objective = "binary:logistic",
+      tree_method = "hist",
+      nthread = 1,
+      scale_pos_weight = !!spw_value
+    )
+  )
+```
+
+## Stage 1 evaluation (occurrence models)
+
+```{r}
+#| label: stage1-occurrence
+#| message: true
+#| warning: true
+
+# Model selection toggles (edit to selectively run models)
+occ_models_to_run <- c(
+  "glm",       # baseline GLM
+  "glmnet",    # GLMNET
+  "lgbm",      # LightGBM
+  "xgb"        # XGBoost
+)
+
+cat("[Stage 1] Evaluating occurrence classifiers\n")
+cat("[Config] Classifiers to run: ", paste(occ_models_to_run, collapse = ", "), "\n", sep = "")
+
+# Compute and report actual strike rate in pretest data
+pos_ratio <- mean(pretest_df$y_occ == "yes")
+n_pos <- sum(pretest_df$y_occ == "yes")
+n_total <- nrow(pretest_df)
+brier_baseline <- pos_ratio * (1 - pos_ratio)
+
+cat("[Data] Pretest strike rate: ", round(pos_ratio * 100, 2), "% (", n_pos, " of ", n_total, " weeks)\n", sep = "")
+cat("[Data] Baseline Brier (always predict ", round(pos_ratio * 100, 2), "%): ", round(brier_baseline, 4), "\n", sep = "")
+
+# Stage 1 control: no racing (use tune_grid instead of tune_race_anova)
+ctrl_occ <- control_grid(
+  save_pred = TRUE, verbose = TRUE, allow_par = TRUE,
+  parallel_over = "resamples", save_workflow = FALSE
+)
+
+# Stage 2 control: no racing (fewer observations, less aggressive elimination needed)
+ctrl_sev <- control_grid(
+  save_pred = TRUE, verbose = TRUE, allow_par = TRUE,
+  parallel_over = "resamples", save_workflow = FALSE
+)
+
+# Containers for results
+occ_fitted_models <- list()
+occ_val_results <- list()
+occ_val_predictions <- list()
+
+# GLM baseline
+if ("glm" %in% occ_models_to_run) {
+  cat("[Stage 1] Running GLM baseline...\n")
+  glm_val <- collect_occurrence_fold_metrics(
+    occ_wfs$glm,
+    val_resamples$splits,
+    split_ids = val_resamples$id,
+    model_name = "glm",
+    capture_last_fit = TRUE
+  )
+  occ_fitted_models$glm <- glm_val$last_fit
+  occ_val_results$glm <- glm_val$metrics
+  occ_val_predictions$glm <- glm_val$predictions
+  cat("[Stage 1] GLM complete.\n")
+} else {
+  cat("[Stage 1] Skipping GLM\n")
+}
+
+# GLMNET
+if ("glmnet" %in% occ_models_to_run) {
+  cat("[Stage 1] Tuning GLMNET... (grid=", nrow(grid_glmnet), ")\n")
+  occ_glmnet_tuned <- tune_grid(
+    occ_wfs$glmnet, resamples = val_resamples,
+    grid = grid_glmnet, metrics = clf_metrics, control = ctrl_occ
+  )
+  # Save tuning metrics and report evaluated counts
+  met_occ_glmnet <- collect_metrics(occ_glmnet_tuned)
+  readr::write_csv(met_occ_glmnet, sprintf("model_outputs/tsr_tuning_metrics_occ_glmnet__%s.csv", sev_selection_metric))
+  cat("[Stage 1] GLMNET configs evaluated:", length(unique(met_occ_glmnet$.config)), "of", nrow(grid_glmnet), "\n")
+  final_glmnet_occ <- finalize_workflow(occ_wfs$glmnet, select_best(occ_glmnet_tuned, metric = "pr_auc_yes"))
+  cat("[Stage 1] Re-fitting GLMNET with best config...\n")
+  glmnet_val <- collect_occurrence_fold_metrics(
+    final_glmnet_occ,
+    val_resamples$splits,
+    split_ids = val_resamples$id,
+    model_name = "glmnet",
+    capture_last_fit = TRUE
+  )
+  occ_fitted_models$glmnet <- glmnet_val$last_fit
+  occ_val_results$glmnet <- glmnet_val$metrics
+  occ_val_predictions$glmnet <- glmnet_val$predictions
+  cat("[Stage 1] GLMNET complete.\n")
+} else {
+  cat("[Stage 1] Skipping GLMNET\n")
+}
+
+# LightGBM
+if ("lgbm" %in% occ_models_to_run) {
+  cat("[Stage 1] Tuning LightGBM... (grid=", nrow(grid_boosted), ")\n")
+  occ_lgbm_tuned <- tune_grid(
+    occ_wfs$lgbm, resamples = val_resamples,
+    grid = grid_boosted, metrics = clf_metrics, control = ctrl_occ
+  )
+  # Save tuning metrics and report evaluated counts
+  met_occ_lgbm <- collect_metrics(occ_lgbm_tuned)
+  readr::write_csv(met_occ_lgbm, sprintf("model_outputs/tsr_tuning_metrics_occ_lgbm__%s.csv", sev_selection_metric))
+  cat("[Stage 1] LightGBM configs evaluated:", length(unique(met_occ_lgbm$.config)), "of", nrow(grid_boosted), "\n")
+  final_lgbm_occ <- finalize_workflow(occ_wfs$lgbm, select_best(occ_lgbm_tuned, metric = "pr_auc_yes"))
+  cat("[Stage 1] Re-fitting LightGBM with best config...\n")
+  lgbm_val <- collect_occurrence_fold_metrics(
+    final_lgbm_occ,
+    val_resamples$splits,
+    split_ids = val_resamples$id,
+    model_name = "lgbm",
+    capture_last_fit = TRUE
+  )
+  occ_fitted_models$lgbm <- lgbm_val$last_fit
+  occ_val_results$lgbm <- lgbm_val$metrics
+  occ_val_predictions$lgbm <- lgbm_val$predictions
+  cat("[Stage 1] LightGBM complete.\n")
+} else {
+  cat("[Stage 1] Skipping LightGBM\n")
+}
+
+# XGBoost
+if ("xgb" %in% occ_models_to_run) {
+  cat("[Stage 1] Tuning XGBoost... (grid=", nrow(grid_boosted), ")\n")
+  occ_xgb_tuned <- tune_grid(
+    occ_wfs$xgb, resamples = val_resamples,
+    grid = grid_boosted, metrics = clf_metrics, control = ctrl_occ
+  )
+  # Save tuning metrics and report evaluated counts
+  met_occ_xgb <- collect_metrics(occ_xgb_tuned)
+  readr::write_csv(met_occ_xgb, sprintf("model_outputs/tsr_tuning_metrics_occ_xgb__%s.csv", sev_selection_metric))
+  cat("[Stage 1] XGBoost configs evaluated:", length(unique(met_occ_xgb$.config)), "of", nrow(grid_boosted), "\n")
+  final_xgb_occ <- finalize_workflow(occ_wfs$xgb, select_best(occ_xgb_tuned, metric = "pr_auc_yes"))
+  cat("[Stage 1] Re-fitting XGBoost with best config...\n")
+  xgb_val <- collect_occurrence_fold_metrics(
+    final_xgb_occ,
+    val_resamples$splits,
+    split_ids = val_resamples$id,
+    model_name = "xgb",
+    capture_last_fit = TRUE
+  )
+  occ_fitted_models$xgb <- xgb_val$last_fit
+  occ_val_results$xgb <- xgb_val$metrics
+  occ_val_predictions$xgb <- xgb_val$predictions
+  cat("[Stage 1] XGBoost complete.\n")
+} else {
+  cat("[Stage 1] Skipping XGBoost\n")
+}
+
+# Summarize occurrence metrics
+if (length(occ_val_results) > 0) {
+  occ_summary <- occ_val_results |>
+    dplyr::bind_rows(.id = "model") |>
+    dplyr::arrange(desc(pr_auc))
+  
+  cat("\n[Stage 1] Occurrence model summary (ranked by PR-AUC):\n")
+  cat("Note: Metrics computed on uncalibrated probabilities\n\n")
+  print(occ_summary)
+  
+  # Save results
+  readr::write_csv(occ_summary, sprintf("model_outputs/tsr_stage1_occurrence_metrics__%s.csv", sev_selection_metric))
+} else {
+  cat("\n[Stage 1] No models were run.\n")
+  occ_summary <- tibble(model = character(0), pr_auc = numeric(0), roc_auc = numeric(0), brier = numeric(0))
+}
+```
+
+## Stage 1: Probability Calibration
+
+```{r}
+#| label: stage1-calibration
+
+cat("\n[Stage 1] Calibrating probabilities for each classifier...\n")
+
+# Helper functions
+logit <- function(p) { p <- pmin(pmax(p, 1e-6), 1 - 1e-6); log(p/(1-p)) }
+
+# Calibrate each classifier's OOF predictions
+occ_calibrated_predictions <- list()
+occ_calibration_info <- list()
+
+for (model_name in names(occ_val_predictions)) {
+  cat("[Calib] Calibrating:", model_name, "... ")
+  
+  pred_tbl <- occ_val_predictions[[model_name]]
+  
+  # Try isotonic regression first
+  calibrate_fn <- NULL
+  calib_method <- NA_character_
+  iso_data <- NULL
+  
+  try({
+    o_iso <- order(pred_tbl$.pred_yes)
+    x_iso <- as.numeric(pred_tbl$.pred_yes[o_iso])
+    y_iso <- as.numeric(pred_tbl$truth[o_iso] == "yes")
+    iso_obj <- stats::isoreg(x_iso, y_iso)
+    iso_x <- x_iso
+    iso_y <- iso_obj$yf
+    
+    calibrate_fn <- function(p) {
+      p <- pmin(pmax(p, 0), 1)
+      as.numeric(approx(x = iso_x, y = iso_y, xout = p, method = "constant", rule = 2, ties = "ordered")$y)
+    }
+    iso_data <- tibble(x = iso_x, y = iso_y, model = model_name)
+    calib_method <- "isotonic"
+  }, silent = TRUE)
+  
+  # Fallback to Platt scaling
+  if (is.null(calibrate_fn)) {
+    platt_df <- tibble(score = logit(pred_tbl$.pred_yes), y = as.integer(pred_tbl$truth == "yes"))
+    platt_model <- glm(y ~ score, data = platt_df, family = binomial())
+    calibrate_fn <- function(p) {
+      s <- logit(p)
+      as.numeric(plogis(predict(platt_model, newdata = tibble(score = s))))
+    }
+    calib_method <- "platt"
+  }
+  
+  cat(calib_method, "\n")
+  
+  # Apply calibration
+  calibrated_preds <- pred_tbl |>
+    mutate(
+      .pred_yes_cal = calibrate_fn(.pred_yes),
+      .pred_no_cal = 1 - .pred_yes_cal
+    )
+  
+  occ_calibrated_predictions[[model_name]] <- calibrated_preds
+  occ_calibration_info[[model_name]] <- list(
+    method = calib_method,
+    calibrate_fn = calibrate_fn,
+    iso_curve = iso_data
+  )
+}
+
+# Save calibration curves
+iso_curves <- occ_calibration_info |>
+  purrr::map("iso_curve") |>
+  purrr::compact() |>
+  dplyr::bind_rows()
+
+if (nrow(iso_curves) > 0) {
+  readr::write_csv(iso_curves, sprintf("model_outputs/tsr_calibration_curves__%s.csv", sev_selection_metric))
+}
+
+cat("[Stage 1] Calibration complete for", length(occ_calibrated_predictions), "classifiers.\n")
+
+# Compute calibrated metrics and show improvement
+cat("\n[Stage 1] Computing post-calibration metrics...\n")
+
+calib_results <- purrr::map_dfr(names(occ_calibrated_predictions), function(model_name) {
+  calib_preds <- occ_calibrated_predictions[[model_name]] |>
+    dplyr::mutate(truth = factor(truth, levels = c("no", "yes")))  # Ensure factor levels
+  
+  # Metrics on calibrated probabilities
+  pr_auc_cal <- yardstick::pr_auc_vec(calib_preds$truth, calib_preds$.pred_yes_cal, event_level = "second")
+  roc_auc_cal <- yardstick::roc_auc_vec(calib_preds$truth, calib_preds$.pred_yes_cal, event_level = "second")
+  brier_cal <- mean((calib_preds$.pred_yes_cal - as.numeric(calib_preds$truth == "yes"))^2)  # Manual Brier calculation
+  
+  # Get uncalibrated metrics for comparison
+  uncal_metrics <- occ_val_results[[model_name]]
+  
+  # Compute Brier Skill Score (improvement over baseline)
+  brier_skill_score <- 1 - (brier_cal / brier_baseline)
+  
+  tibble(
+    model = model_name,
+    pr_auc = pr_auc_cal,
+    roc_auc = roc_auc_cal,
+    brier_uncal = uncal_metrics$brier,
+    brier_cal = brier_cal,
+    brier_improvement = (uncal_metrics$brier - brier_cal) / uncal_metrics$brier * 100,
+    brier_skill = brier_skill_score,
+    calib_method = occ_calibration_info[[model_name]]$method
+  )
+})
+
+cat("\n[Stage 1] Calibration results (ranked by PR-AUC):\n")
+cat("Note: PR-AUC and ROC-AUC unchanged (calibration preserves ranking)\n")
+cat("      brier_improvement: % reduction from uncalibrated to calibrated\n")
+cat("      brier_skill: improvement over baseline (like R²; higher is better)\n\n")
+print(calib_results |> arrange(desc(pr_auc)))
+
+# Save calibration results
+readr::write_csv(calib_results, sprintf("model_outputs/tsr_stage1_calibration_results__%s.csv", sev_selection_metric))
+
+cat("\n[Stage 1] Calibration reporting complete.\n")
+
+# Save calibrated predictions for later analysis
+cat("[Stage 1] Saving calibrated predictions to disk...\n")
+arrow::write_parquet(
+  bind_rows(occ_calibrated_predictions, .id = "model"),
+  sprintf("model_outputs/tsr_stage1_calibrated_predictions__%s.parquet", sev_selection_metric)
+)
+```
+
+## Stage 2: Severity Model Evaluation
+
+```{r}
+#| label: stage2-severity
+#| message: true
+#| warning: true
+
+# Model selection toggle for severity models
+sev_models_to_run <- c(
+  "lm_log",
+  "glmnet_log",
+  "lgbm_log",
+  "xgb_log",
+  "gamma_lgbm",
+  "gamma_xgb"
+)
+
+cat("\n[Stage 2] Evaluating severity models on positives\n")
+cat("[Config] Severity models to run: ", paste(sev_models_to_run, collapse = ", "), "\n", sep = "")
+cat("[Config] Selection metric: ", toupper(sev_selection_metric), "\n", sep = "")
+
+# Build positive-only resamples
+pos_pretest_df <- pretest_df |> filter(strike_count > 0)
+
+map_split_to_pos <- function(split) {
+  analysis_dates <- rsample::analysis(split)$date
+  assessment_dates <- rsample::assessment(split)$date
+  pos_analysis_idx <- which(pos_pretest_df$date %in% analysis_dates)
+  pos_assessment_idx <- which(pos_pretest_df$date %in% assessment_dates)
+  rsample::make_splits(list(analysis = pos_analysis_idx, assessment = pos_assessment_idx), pos_pretest_df)
+}
+
+pos_val_splits <- purrr::map(val_resamples$splits, map_split_to_pos)
+pos_val_resamples <- rsample::manual_rset(pos_val_splits, val_resamples$id)
+
+# Containers for results
+sev_fitted_models <- list()
+sev_val_results <- list()
+sev_val_predictions_all_rows <- list()  # Predictions on ALL rows (for combination)
+
+# LM log
+if ("lm_log" %in% sev_models_to_run) {
+  cat("[Stage 2] Running LM log (no tuning)...\n")
+  lm_log_val <- collect_fold_metrics(
+    sev_wfs$lm_log,
+    pos_val_resamples$splits,
+    backtransform = function(x) pmax(expm1(x), 0),
+    model_type = "log",
+    use_smearing = TRUE,
+    split_ids = pos_val_resamples$id,
+    model_name = "lm_log",
+    capture_last_fit = TRUE
+  )
+  sev_fitted_models$lm_log <- lm_log_val$last_fit
+  sev_val_results$lm_log <- lm_log_val$metrics
+  
+  # Predict on ALL rows for joint optimization
+  all_row_preds <- purrr::map2_dfr(val_resamples$splits, pos_val_resamples$splits, function(split_all, split_pos) {
+    assess_all <- rsample::assessment(split_all)
+    analysis_pos <- rsample::analysis(split_pos)
+    fit_obj <- fit(sev_wfs$lm_log, data = analysis_pos)
+    preds_raw <- predict(fit_obj, new_data = assess_all)$.pred
+    # Smearing
+    train_pred_log <- predict(fit_obj, new_data = analysis_pos)$.pred
+    log_resids <- log1p(analysis_pos$strike_count) - train_pred_log
+    smear_factor <- compute_smearing_factor(log_resids)
+    preds <- pmax(smearing_backtransform(preds_raw, smear_factor) - 1, 0)
+    tibble(truth = assess_all$strike_count, .pred = preds)
+  })
+  sev_val_predictions_all_rows$lm_log <- all_row_preds
+  cat("[Stage 2] LM log complete.\n")
+} else {
+  cat("[Stage 2] Skipping LM log\n")
+}
+
+# GLMNET log
+if ("glmnet_log" %in% sev_models_to_run) {
+  cat("[Stage 2] Tuning GLMNET log... (grid=", nrow(grid_glmnet), ")\n")
+  sev_glmnet_tuned <- tune_grid(
+    sev_wfs$glmnet_log,
+    resamples = pos_val_resamples,
+    grid = grid_glmnet,
+    metrics = reg_metrics,
+    control = ctrl_sev
+  )
+  # Save tuning metrics and report evaluated counts
+  met_sev_glmnet <- collect_metrics(sev_glmnet_tuned)
+  readr::write_csv(met_sev_glmnet, sprintf("model_outputs/tsr_tuning_metrics_sev_glmnet_log__%s.csv", sev_selection_metric))
+  cat("[Stage 2] GLMNET configs evaluated:", length(unique(met_sev_glmnet$.config)), "of", nrow(grid_glmnet), "\n")
+  final_glmnet_sev <- finalize_workflow(sev_wfs$glmnet_log, select_best(sev_glmnet_tuned, metric = sev_selection_metric))
+  cat("[Stage 2] Re-fitting GLMNET log with best config...\n")
+  glmnet_log_val <- collect_fold_metrics(
+    final_glmnet_sev,
+    pos_val_resamples$splits,
+    backtransform = function(x) pmax(expm1(x), 0),
+    model_type = "log",
+    use_smearing = TRUE,
+    split_ids = pos_val_resamples$id,
+    model_name = "glmnet_log",
+    capture_last_fit = TRUE
+  )
+  sev_fitted_models$glmnet_log <- glmnet_log_val$last_fit
+  sev_val_results$glmnet_log <- glmnet_log_val$metrics
+  
+  # Predict on ALL rows
+  all_row_preds <- purrr::map2_dfr(val_resamples$splits, pos_val_resamples$splits, function(split_all, split_pos) {
+    assess_all <- rsample::assessment(split_all)
+    analysis_pos <- rsample::analysis(split_pos)
+    fit_obj <- fit(final_glmnet_sev, data = analysis_pos)
+    preds_raw <- predict(fit_obj, new_data = assess_all)$.pred
+    # Smearing
+    train_pred_log <- predict(fit_obj, new_data = analysis_pos)$.pred
+    log_resids <- log1p(analysis_pos$strike_count) - train_pred_log
+    smear_factor <- compute_smearing_factor(log_resids)
+    preds <- pmax(smearing_backtransform(preds_raw, smear_factor) - 1, 0)
+    tibble(truth = assess_all$strike_count, .pred = preds)
+  })
+  sev_val_predictions_all_rows$glmnet_log <- all_row_preds
+  cat("[Stage 2] GLMNET log complete.\n")
+} else {
+  cat("[Stage 2] Skipping GLMNET log\n")
+}
+
+# LightGBM log
+if ("lgbm_log" %in% sev_models_to_run) {
+  cat("[Stage 2] Tuning LightGBM log... (grid=", nrow(grid_boosted), ")\n")
+  sev_lgbm_tuned <- tune_grid(
+    sev_wfs$lgbm_log,
+    resamples = pos_val_resamples,
+    grid = grid_boosted,
+    metrics = reg_metrics,
+    control = ctrl_sev
+  )
+  # Save tuning metrics and report evaluated counts
+  met_sev_lgbm <- collect_metrics(sev_lgbm_tuned)
+  readr::write_csv(met_sev_lgbm, sprintf("model_outputs/tsr_tuning_metrics_sev_lgbm_log__%s.csv", sev_selection_metric))
+  cat("[Stage 2] LightGBM configs evaluated:", length(unique(met_sev_lgbm$.config)), "of", nrow(grid_boosted), "\n")
+  final_lgbm_sev <- finalize_workflow(sev_wfs$lgbm_log, select_best(sev_lgbm_tuned, metric = sev_selection_metric))
+  cat("[Stage 2] Re-fitting LightGBM log with best config...\n")
+  lgbm_log_val <- collect_fold_metrics(
+    final_lgbm_sev,
+    pos_val_resamples$splits,
+    backtransform = function(x) pmax(expm1(x), 0),
+    model_type = "log",
+    use_smearing = TRUE,
+    split_ids = pos_val_resamples$id,
+    model_name = "lgbm_log",
+    capture_last_fit = TRUE
+  )
+  sev_fitted_models$lgbm_log <- lgbm_log_val$last_fit
+  sev_val_results$lgbm_log <- lgbm_log_val$metrics
+  
+  # Predict on ALL rows
+  all_row_preds <- purrr::map2_dfr(val_resamples$splits, pos_val_resamples$splits, function(split_all, split_pos) {
+    assess_all <- rsample::assessment(split_all)
+    analysis_pos <- rsample::analysis(split_pos)
+    fit_obj <- fit(final_lgbm_sev, data = analysis_pos)
+    preds_raw <- predict(fit_obj, new_data = assess_all)$.pred
+    # Smearing
+    train_pred_log <- predict(fit_obj, new_data = analysis_pos)$.pred
+    log_resids <- log1p(analysis_pos$strike_count) - train_pred_log
+    smear_factor <- compute_smearing_factor(log_resids)
+    preds <- pmax(smearing_backtransform(preds_raw, smear_factor) - 1, 0)
+    tibble(truth = assess_all$strike_count, .pred = preds)
+  })
+  sev_val_predictions_all_rows$lgbm_log <- all_row_preds
+  cat("[Stage 2] LightGBM log complete.\n")
+} else {
+  cat("[Stage 2] Skipping LightGBM log\n")
+}
+
+# XGBoost log
+if ("xgb_log" %in% sev_models_to_run) {
+  cat("[Stage 2] Tuning XGBoost log... (grid=", nrow(grid_boosted), ")\n")
+  sev_xgb_tuned <- tune_grid(
+    sev_wfs$xgb_log,
+    resamples = pos_val_resamples,
+    grid = grid_boosted,
+    metrics = reg_metrics,
+    control = ctrl_sev
+  )
+  # Save tuning metrics and report evaluated counts
+  met_sev_xgb <- collect_metrics(sev_xgb_tuned)
+  readr::write_csv(met_sev_xgb, sprintf("model_outputs/tsr_tuning_metrics_sev_xgb_log__%s.csv", sev_selection_metric))
+  cat("[Stage 2] XGBoost configs evaluated:", length(unique(met_sev_xgb$.config)), "of", nrow(grid_boosted), "\n")
+  final_xgb_sev <- finalize_workflow(sev_wfs$xgb_log, select_best(sev_xgb_tuned, metric = sev_selection_metric))
+  cat("[Stage 2] Re-fitting XGBoost log with best config...\n")
+  xgb_log_val <- collect_fold_metrics(
+    final_xgb_sev,
+    pos_val_resamples$splits,
+    backtransform = function(x) pmax(expm1(x), 0),
+    model_type = "log",
+    use_smearing = TRUE,
+    split_ids = pos_val_resamples$id,
+    model_name = "xgb_log",
+    capture_last_fit = TRUE
+  )
+  sev_fitted_models$xgb_log <- xgb_log_val$last_fit
+  sev_val_results$xgb_log <- xgb_log_val$metrics
+  
+  # Predict on ALL rows
+  all_row_preds <- purrr::map2_dfr(val_resamples$splits, pos_val_resamples$splits, function(split_all, split_pos) {
+    assess_all <- rsample::assessment(split_all)
+    analysis_pos <- rsample::analysis(split_pos)
+    fit_obj <- fit(final_xgb_sev, data = analysis_pos)
+    preds_raw <- predict(fit_obj, new_data = assess_all)$.pred
+    # Smearing
+    train_pred_log <- predict(fit_obj, new_data = analysis_pos)$.pred
+    log_resids <- log1p(analysis_pos$strike_count) - train_pred_log
+    smear_factor <- compute_smearing_factor(log_resids)
+    preds <- pmax(smearing_backtransform(preds_raw, smear_factor) - 1, 0)
+    tibble(truth = assess_all$strike_count, .pred = preds)
+  })
+  sev_val_predictions_all_rows$xgb_log <- all_row_preds
+  cat("[Stage 2] XGBoost log complete.\n")
+} else {
+  cat("[Stage 2] Skipping XGBoost log\n")
+}
+
+# Gamma LightGBM
+if ("gamma_lgbm" %in% sev_models_to_run) {
+  cat("[Stage 2] Tuning Gamma LightGBM... (grid=", nrow(grid_boosted), ")\n")
+  sev_gamma_lgbm_tuned <- tune_grid(
+    sev_wfs$gamma_lgbm,
+    resamples = pos_val_resamples,
+    grid = grid_boosted,
+    metrics = reg_metrics,
+    control = ctrl_sev
+  )
+  # Save tuning metrics and report evaluated counts
+  met_sev_gamma_lgbm <- collect_metrics(sev_gamma_lgbm_tuned)
+  readr::write_csv(met_sev_gamma_lgbm, sprintf("model_outputs/tsr_tuning_metrics_sev_gamma_lgbm__%s.csv", sev_selection_metric))
+  cat("[Stage 2] Gamma LightGBM configs evaluated:", length(unique(met_sev_gamma_lgbm$.config)), "of", nrow(grid_boosted), "\n")
+  final_gamma_lgbm_sev <- finalize_workflow(sev_wfs$gamma_lgbm, select_best(sev_gamma_lgbm_tuned, metric = sev_selection_metric))
+  cat("[Stage 2] Re-fitting Gamma LightGBM with best config...\n")
+  gamma_lgbm_val <- collect_fold_metrics(
+    final_gamma_lgbm_sev,
+    pos_val_resamples$splits,
+    backtransform = identity,
+    model_type = "gamma",
+    split_ids = pos_val_resamples$id,
+    model_name = "gamma_lgbm",
+    capture_last_fit = TRUE
+  )
+  sev_fitted_models$gamma_lgbm <- gamma_lgbm_val$last_fit
+  sev_val_results$gamma_lgbm <- gamma_lgbm_val$metrics
+  
+  # Predict on ALL rows
+  all_row_preds <- purrr::map2_dfr(val_resamples$splits, pos_val_resamples$splits, function(split_all, split_pos) {
+    assess_all <- rsample::assessment(split_all)
+    analysis_pos <- rsample::analysis(split_pos)
+    fit_obj <- fit(final_gamma_lgbm_sev, data = analysis_pos)
+    preds <- pmax(predict(fit_obj, new_data = assess_all)$.pred, 0)
+    tibble(truth = assess_all$strike_count, .pred = preds)
+  })
+  sev_val_predictions_all_rows$gamma_lgbm <- all_row_preds
+  cat("[Stage 2] Gamma LightGBM complete.\n")
+} else {
+  cat("[Stage 2] Skipping Gamma LightGBM\n")
+}
+
+# Gamma XGBoost
+if ("gamma_xgb" %in% sev_models_to_run) {
+  cat("[Stage 2] Tuning Gamma XGBoost... (grid=", nrow(grid_boosted), ")\n")
+  sev_gamma_xgb_tuned <- tune_grid(
+    sev_wfs$gamma_xgb,
+    resamples = pos_val_resamples,
+    grid = grid_boosted,
+    metrics = reg_metrics,
+    control = ctrl_sev
+  )
+  # Save tuning metrics and report evaluated counts
+  met_sev_gamma_xgb <- collect_metrics(sev_gamma_xgb_tuned)
+  readr::write_csv(met_sev_gamma_xgb, sprintf("model_outputs/tsr_tuning_metrics_sev_gamma_xgb__%s.csv", sev_selection_metric))
+  cat("[Stage 2] Gamma XGBoost configs evaluated:", length(unique(met_sev_gamma_xgb$.config)), "of", nrow(grid_boosted), "\n")
+  final_gamma_xgb_sev <- finalize_workflow(sev_wfs$gamma_xgb, select_best(sev_gamma_xgb_tuned, metric = sev_selection_metric))
+  cat("[Stage 2] Re-fitting Gamma XGBoost with best config...\n")
+  gamma_xgb_val <- collect_fold_metrics(
+    final_gamma_xgb_sev,
+    pos_val_resamples$splits,
+    backtransform = identity,
+    model_type = "gamma",
+    split_ids = pos_val_resamples$id,
+    model_name = "gamma_xgb",
+    capture_last_fit = TRUE
+  )
+  sev_fitted_models$gamma_xgb <- gamma_xgb_val$last_fit
+  sev_val_results$gamma_xgb <- gamma_xgb_val$metrics
+  
+  # Predict on ALL rows
+  all_row_preds <- purrr::map2_dfr(val_resamples$splits, pos_val_resamples$splits, function(split_all, split_pos) {
+    assess_all <- rsample::assessment(split_all)
+    analysis_pos <- rsample::analysis(split_pos)
+    fit_obj <- fit(final_gamma_xgb_sev, data = analysis_pos)
+    preds <- pmax(predict(fit_obj, new_data = assess_all)$.pred, 0)
+    tibble(truth = assess_all$strike_count, .pred = preds)
+  })
+  sev_val_predictions_all_rows$gamma_xgb <- all_row_preds
+  cat("[Stage 2] Gamma XGBoost complete.\n")
+} else {
+  cat("[Stage 2] Skipping Gamma XGBoost\n")
+}
+
+# Summarize severity metrics (on positives only)
+if (length(sev_val_results) > 0) {
+  sev_summary <- sev_val_results |>
+    dplyr::bind_rows(.id = "model") |>
+    dplyr::arrange(.data[[sev_selection_metric]])
+  
+  # Compute supplementary metrics from predictions on ALL rows
+  cat("\n[Stage 2] Computing supplementary metrics (pseudo-R² for gamma models)...\n")
+  sev_supplementary <- purrr::map_dfr(names(sev_val_predictions_all_rows), function(model_name) {
+    preds_df <- sev_val_predictions_all_rows[[model_name]]
+    supp <- tibble(model = model_name)
+    
+    # Pseudo-R² for gamma models (gamma deviance-based)
+    if (model_name %in% c("gamma_lgbm", "gamma_xgb")) {
+      pseudo_r2 <- compute_pseudo_r2(preds_df$truth, preds_df$.pred, family = "gamma")
+      supp$pseudo_r2_gamma <- pseudo_r2
+    }
+    
+    supp
+  })
+  
+  # Merge supplementary metrics into summary
+  if (nrow(sev_supplementary) > 0 && any(names(sev_supplementary) != "model")) {
+    sev_summary <- sev_summary |>
+      left_join(sev_supplementary, by = "model")
+  }
+  
+  cat("\n[Stage 2] Severity model summary (on positives, ranked by ", toupper(sev_selection_metric), "):\n", sep = "")
+  print(sev_summary)
+  
+  # Save results
+  readr::write_csv(sev_summary, sprintf("model_outputs/tsr_stage2_severity_metrics__%s.csv", sev_selection_metric))
+  
+  # Save severity predictions on all rows for later analysis
+  cat("\n[Stage 2] Saving severity predictions (all rows) to disk...\n")
+  arrow::write_parquet(
+    bind_rows(sev_val_predictions_all_rows, .id = "model"),
+    sprintf("model_outputs/tsr_stage2_predictions_all_rows__%s.parquet", sev_selection_metric)
+  )
+} else {
+  cat("\n[Stage 2] No severity models were run.\n")
+  sev_summary <- tibble(model = character(0), mae = numeric(0), rmse = numeric(0), rsq = numeric(0))
+}
+```
+
+## Model Selection: Joint Optimization
+
+```{r}
+#| label: joint-optimization
+
+cat("\n[Joint] Testing all classifier × severity combinations...\n")
+
+# Test all combinations
+joint_results <- list()
+
+for (clf_name in names(occ_calibrated_predictions)) {
+  for (sev_name in names(sev_val_predictions_all_rows)) {
+    # Get calibrated probabilities and severity predictions
+    calib_preds <- occ_calibrated_predictions[[clf_name]]
+    sev_preds <- sev_val_predictions_all_rows[[sev_name]]
+    
+    # Combine: prob × severity
+    combined_pred <- calib_preds$.pred_yes_cal * sev_preds$.pred
+    truth <- sev_preds$truth
+    
+    # Compute combined metrics
+    combined_rmse <- yardstick::rmse_vec(truth, combined_pred)
+    combined_mae <- yardstick::mae_vec(truth, combined_pred)
+    combined_rsq <- yardstick::rsq_vec(truth, combined_pred)
+    
+    # Store result
+    joint_results[[paste(clf_name, sev_name, sep = "__")]] <- tibble(
+      classifier = clf_name,
+      severity_model = sev_name,
+      combined_rmse = combined_rmse,
+      combined_mae = combined_mae,
+      combined_rsq = combined_rsq
+    )
+  }
+}
+
+# Combine all results
+joint_summary <- dplyr::bind_rows(joint_results) |>
+  dplyr::arrange(.data[[paste0("combined_", sev_selection_metric)]])
+
+cat("\n[Joint] All combinations (ranked by combined ", toupper(sev_selection_metric), "):\n", sep = "")
+print(joint_summary, n = Inf)
+
+# Select best combination
+best_clf <- joint_summary$classifier[1]
+best_sev <- joint_summary$severity_model[1]
+
+cat("\n[Selection] Best pipeline: ", best_clf, " + ", best_sev, "\n", sep = "")
+cat("[Selection] Combined ", toupper(sev_selection_metric), ": ", 
+    round(joint_summary[[paste0("combined_", sev_selection_metric)]][1], 4), "\n", sep = "")
+
+# Save results
+readr::write_csv(joint_summary, sprintf("model_outputs/tsr_joint_optimization_results__%s.csv", sev_selection_metric))
+
+# Save best selection info
+best_selection <- list(
+  best_classifier = best_clf,
+  best_severity_model = best_sev,
+  calibration_method = occ_calibration_info[[best_clf]]$method,
+  selection_metric = sev_selection_metric,
+  combined_rmse = joint_summary$combined_rmse[1],
+  combined_mae = joint_summary$combined_mae[1],
+  combined_rsq = joint_summary$combined_rsq[1]
+)
+saveRDS(best_selection, sprintf("model_outputs/tsr_best_pipeline_selection__%s.rds", sev_selection_metric))
+```
+
+## Test Set Evaluation
+
+```{r}
+#| label: final-test
+
+cat("\n[Test] Evaluating best pipeline on test set\n")
+cat("[Test] Best pipeline: ", best_clf, " + ", best_sev, "\n", sep = "")
+
+# Use already-fitted models from fold 3 (last fold)
+final_clf_fit <- occ_fitted_models[[best_clf]]
+final_sev_fit <- sev_fitted_models[[best_sev]]
+
+if (is.null(final_clf_fit) || is.null(final_sev_fit)) {
+  stop("Fitted models not found. Ensure best models were captured during validation.")
+}
+
+# Get calibration function for best classifier
+calibrate_fn <- occ_calibration_info[[best_clf]]$calibrate_fn
+
+# Test predictions - occurrence
+cat("[Test] Generating occurrence predictions...\n")
+raw_prob_test <- predict(final_clf_fit, new_data = test_df, type = "prob")$.pred_yes
+prob_yes_test <- pmin(pmax(calibrate_fn(raw_prob_test), 0), 1)
+
+# Test predictions - severity
+cat("[Test] Generating severity predictions...\n")
+pretest_pos <- pretest_df |> filter(strike_count > 0)
+
+# Tidymodels prediction
+sev_hat_test_raw <- predict(final_sev_fit, new_data = test_df)$.pred
+
+# Apply smearing for log1p models
+if (best_sev %in% c("lm_log", "glmnet_log", "lgbm_log", "xgb_log")) {
+  train_pred_log <- predict(final_sev_fit, new_data = pretest_pos)$.pred
+  log_resids <- log1p(pretest_pos$strike_count) - train_pred_log
+  smear_factor <- compute_smearing_factor(log_resids)
+  sev_hat_test <- pmax(smearing_backtransform(sev_hat_test_raw, smear_factor) - 1, 0)
+} else {
+  sev_hat_test <- pmax(sev_hat_test_raw, 0)
+}
+
+# Clean up predictions
+sev_hat_test <- pmax(pmin(sev_hat_test, quantile(sev_hat_test, 0.999, na.rm = TRUE)), 0)
+sev_hat_test[!is.finite(sev_hat_test)] <- 0
+
+# Combined prediction
+combined_hat_test <- prob_yes_test * sev_hat_test
+
+# Compute metrics
+cat("[Test] Computing metrics...\n")
+
+# Occurrence metrics (using calibrated probabilities)
+truth_occ <- factor(test_df$y_occ, levels = c("no", "yes"))
+brier_test <- mean((prob_yes_test - as.numeric(truth_occ == "yes"))^2)
+
+occ_tbl <- tibble(
+  .metric = c("pr_auc", "roc_auc", "brier"),
+  .estimator = "binary",
+  .estimate = c(
+    yardstick::pr_auc_vec(truth_occ, prob_yes_test, event_level = "second"),
+    yardstick::roc_auc_vec(truth_occ, prob_yes_test, event_level = "second"),
+    brier_test
+  )
+)
+
+# Severity metrics (on positives only)
+sev_pos_idx <- which(test_df$strike_count > 0)
+sev_tbl <- metric_set(mae, rmse, rsq)(
+  bind_cols(truth = test_df$strike_count[sev_pos_idx], .pred = sev_hat_test[sev_pos_idx]),
+  truth = truth, estimate = .pred
+)
+
+# Add supplementary metrics for severity models
+if (best_sev %in% c("gamma_lgbm", "gamma_xgb")) {
+  # Pseudo-R² for gamma models (on all observations)
+  pseudo_r2_val <- compute_pseudo_r2(test_df$strike_count, sev_hat_test, family = "gamma")
+  sev_tbl <- bind_rows(sev_tbl,
+    tibble(.metric = "pseudo_r2_gamma", .estimator = "standard", .estimate = pseudo_r2_val))
+  cat(sprintf("[Test] Pseudo-R² (Gamma deviance) for severity: %.4f\n", pseudo_r2_val))
+}
+
+# Combined metrics (all observations)
+combined_tbl <- metric_set(mae, rmse, rsq)(
+  bind_cols(truth = test_df$strike_count, .pred = combined_hat_test),
+  truth = truth, estimate = .pred
+)
+
+cat("\n[Test] Occurrence metrics (probabilities):\n")
+print(occ_tbl)
+
+cat("\n[Test] Severity metrics (on positives):\n")
+print(sev_tbl)
+
+cat("\n[Test] Combined metrics (all observations):\n")
+print(combined_tbl)
+
+# Save outputs
+cat("\n[Test] Saving results...\n")
+dir.create("model_outputs", showWarnings = FALSE)
+
+arrow::write_parquet(
+  tibble(
+    date = test_df$date,
+    prob_yes = prob_yes_test,
+    sev_hat = sev_hat_test,
+    expected_count = combined_hat_test,
+    actual_count = test_df$strike_count
+  ),
+  sprintf("model_outputs/two_stage_refined_test_predictions__%s.parquet", sev_selection_metric)
+)
+
+readr::write_csv(occ_tbl, sprintf("model_outputs/two_stage_refined_test_occ__%s.csv", sev_selection_metric))
+readr::write_csv(sev_tbl, sprintf("model_outputs/two_stage_refined_test_sev__%s.csv", sev_selection_metric))
+readr::write_csv(combined_tbl, sprintf("model_outputs/two_stage_refined_test_combined__%s.csv", sev_selection_metric))
+
+# Save complete selection info
+final_selection_info <- list(
+  best_classifier = best_clf,
+  best_severity_model = best_sev,
+  calibration_method = occ_calibration_info[[best_clf]]$method,
+  selection_metric = sev_selection_metric,
+  val_combined_rmse = joint_summary$combined_rmse[1],
+  val_combined_mae = joint_summary$combined_mae[1],
+  val_combined_rsq = joint_summary$combined_rsq[1],
+  test_combined_rmse = combined_tbl$.estimate[combined_tbl$.metric == "rmse"],
+  test_combined_mae = combined_tbl$.estimate[combined_tbl$.metric == "mae"],
+  test_combined_rsq = combined_tbl$.estimate[combined_tbl$.metric == "rsq"]
+)
+
+saveRDS(final_selection_info, sprintf("model_outputs/two_stage_refined_selection__%s.rds", sev_selection_metric))
+
+cat("[Test] Evaluation complete!\n")
+```
+
+## Feature Importance
+
+```{r}
+#| label: feature-importance
+
+cat("\n[Importance] Extracting feature importance from best models...\n")
+
+# Stage 1: Occurrence classifier importance
+if (best_clf %in% c("lgbm", "xgb")) {
+  cat("[Importance] Extracting Stage 1 (occurrence) importance from:", best_clf, "\n")
+  
+  occ_importance <- vip::vi_model(final_clf_fit) |>
+    arrange(desc(Importance)) |>
+    mutate(model = best_clf, stage = "occurrence")
+  
+  # Save
+  arrow::write_parquet(
+    occ_importance,
+    sprintf("model_outputs/tsr_stage1_feature_importance__%s.parquet", sev_selection_metric)
+  )
+  
+  cat("[Importance] Top 10 features for Stage 1 (occurrence):\n")
+  print(head(occ_importance, 10))
+} else {
+  cat("[Importance] Stage 1 classifier (", best_clf, ") is not tree-based; native importance not available\n", sep = "")
+  cat("[Importance] Use coefficient analysis or permutation importance for linear classifiers\n")
+}
+
+# Stage 2: Severity model importance
+if (best_sev %in% c("lgbm_log", "xgb_log", "gamma_lgbm", "gamma_xgb")) {
+  cat("\n[Importance] Extracting Stage 2 (severity) importance from:", best_sev, "\n")
+  
+  sev_importance <- vip::vi_model(final_sev_fit) |>
+    arrange(desc(Importance)) |>
+    mutate(model = best_sev, stage = "severity")
+  
+  # Save
+  arrow::write_parquet(
+    sev_importance,
+    sprintf("model_outputs/tsr_stage2_feature_importance__%s.parquet", sev_selection_metric)
+  )
+  
+  cat("[Importance] Top 10 features for Stage 2 (severity):\n")
+  print(head(sev_importance, 10))
+} else {
+  cat("\n[Importance] Stage 2 model (", best_sev, ") is not tree-based; native importance not available\n", sep = "")
+  cat("[Importance] Use coefficient analysis or permutation importance for linear models\n")
+}
+
+cat("\n[Importance] Feature importance extraction complete!\n")
+```
+
+## Naive Baseline Comparisons: Stage 1 (Occurrence) Validation Set
+
+```{r}
+#| label: naive-baselines-stage1-validation
+
+cat("\n[Naive Baselines] Computing Stage 1 (occurrence) validation set baseline predictions...\n")
+
+# Helper to compute Stage 1 baseline predictions per fold
+compute_stage1_baseline_fold <- function(split, baseline_type) {
+  analysis_data <- rsample::analysis(split)
+  assessment_data <- rsample::assessment(split)
+  
+  if (baseline_type == "mean_occ") {
+    # Always predict mean occurrence rate
+    occ_rate <- mean(analysis_data$y_occ == "yes", na.rm = TRUE)
+    pred <- rep(occ_rate, nrow(assessment_data))
+  } else if (baseline_type == "median_occ") {
+    # Always predict median occurrence rate (0 or 1)
+    occ_rate <- median(as.numeric(analysis_data$y_occ == "yes"), na.rm = TRUE)
+    pred <- rep(occ_rate, nrow(assessment_data))
+  } else if (baseline_type == "zero_occ") {
+    # Always predict 0% occurrence
+    pred <- rep(0, nrow(assessment_data))
+  } else if (baseline_type == "persistence_occ") {
+    # Use lag1 occurrence (was there a strike last week?)
+    pred <- as.numeric(assessment_data$strike_count_lag1 > 0)
+  } else if (baseline_type == "rolling_4wk_occ") {
+    # Use rolling occurrence rate over 4 weeks
+    pred <- assessment_data$rolling_avg_4wk / pmax(assessment_data$rolling_avg_4wk + 1, 1)  # Rough occurrence rate
+    pred <- pmin(pred, 1)  # Cap at 1
+  } else if (baseline_type == "rolling_8wk_occ") {
+    # Use rolling occurrence rate over 8 weeks
+    pred <- assessment_data$rolling_avg_8wk / pmax(assessment_data$rolling_avg_8wk + 1, 1)  # Rough occurrence rate
+    pred <- pmin(pred, 1)  # Cap at 1
+  }
+  
+  # Clean up predictions (cap between 0 and 1)
+  pred <- pmax(pmin(pred, 1), 0, na.rm = TRUE)
+  pred[!is.finite(pred)] <- 0
+  
+  tibble(
+    truth = as.numeric(assessment_data$y_occ == "yes"),
+    .pred = pred,
+    baseline_type = baseline_type
+  )
+}
+
+# Compute all Stage 1 baseline predictions across validation folds
+baseline_types <- c("mean_occ", "median_occ", "zero_occ", "persistence_occ", "rolling_4wk_occ", "rolling_8wk_occ")
+naive_stage1_val_predictions <- list()
+
+for (baseline in baseline_types) {
+  cat("[Stage 1 Baseline] Computing", baseline, "predictions across validation folds...\n")
+  
+  # Get predictions for all folds
+  fold_preds <- purrr::map_dfr(val_resamples$splits, ~ compute_stage1_baseline_fold(.x, baseline))
+  
+  # Compute pooled metrics (concatenated across all folds)
+  pooled_metrics <- tibble(
+    model = paste0("naive_", baseline),
+    mae = yardstick::mae_vec(fold_preds$truth, fold_preds$.pred),
+    rmse = yardstick::rmse_vec(fold_preds$truth, fold_preds$.pred),
+    rsq = yardstick::rsq_vec(fold_preds$truth, fold_preds$.pred)
+  )
+  
+  naive_stage1_val_predictions[[baseline]] <- pooled_metrics
+}
+
+# Combine all Stage 1 baseline results
+naive_stage1_val_summary <- bind_rows(naive_stage1_val_predictions) |>
+  arrange(desc(rsq))  # For occurrence, higher R² is better
+
+cat("\n[Naive Baselines] Stage 1 (occurrence) validation set results (ranked by R²):\n")
+print(naive_stage1_val_summary)
+
+# Save Stage 1 validation baseline results (metric-agnostic filename)
+readr::write_csv(naive_stage1_val_summary, "model_outputs/tsr_naive_stage1_validation.csv")
+
+cat("\n[Naive Baselines] Stage 1 validation baselines saved.\n")
+```
+
+## Naive Baseline Comparisons: Stage 2 (Severity) Validation Set
+
+```{r}
+#| label: naive-baselines-stage2-validation
+
+cat("\n[Naive Baselines] Computing Stage 2 (severity) validation set baseline predictions...\n")
+
+# Build positive-only validation resamples (same as in main analysis)
+pos_pretest_df <- pretest_df |> filter(strike_count > 0)
+
+map_split_to_pos <- function(split) {
+  analysis_dates <- rsample::analysis(split)$date
+  assessment_dates <- rsample::assessment(split)$date
+  pos_analysis_idx <- which(pos_pretest_df$date %in% analysis_dates)
+  pos_assessment_idx <- which(pos_pretest_df$date %in% assessment_dates)
+  rsample::make_splits(list(analysis = pos_analysis_idx, assessment = pos_assessment_idx), pos_pretest_df)
+}
+
+pos_val_splits <- purrr::map(val_resamples$splits, map_split_to_pos)
+pos_val_resamples <- rsample::manual_rset(pos_val_splits, val_resamples$id)
+
+# Helper to compute Stage 2 baseline predictions per fold (on positives only)
+compute_stage2_baseline_fold <- function(split, baseline_type) {
+  analysis_data <- rsample::analysis(split)
+  assessment_data <- rsample::assessment(split)
+  
+  if (baseline_type == "mean_sev") {
+    # Always predict mean severity when strikes occur
+    sev_mean <- mean(analysis_data$strike_count, na.rm = TRUE)
+    pred <- rep(sev_mean, nrow(assessment_data))
+  } else if (baseline_type == "median_sev") {
+    # Always predict median severity when strikes occur
+    sev_median <- median(analysis_data$strike_count, na.rm = TRUE)
+    pred <- rep(sev_median, nrow(assessment_data))
+  } else if (baseline_type == "zero_sev") {
+    # Always predict 0 severity (but only when strikes predicted)
+    pred <- rep(0, nrow(assessment_data))
+  } else if (baseline_type == "persistence_sev") {
+    # Use lag1 severity when strikes occur
+    pred <- assessment_data$strike_count_lag1
+  } else if (baseline_type == "rolling_4wk_sev") {
+    # Use rolling severity average over 4 weeks
+    pred <- assessment_data$rolling_avg_4wk
+  } else if (baseline_type == "rolling_8wk_sev") {
+    # Use rolling severity average over 8 weeks
+    pred <- assessment_data$rolling_avg_8wk
+  }
+  
+  # Clean up predictions (cap at 0, handle NAs)
+  pred <- pmax(pred, 0, na.rm = TRUE)
+  pred[!is.finite(pred)] <- 0
+  
+  tibble(
+    truth = assessment_data$strike_count,
+    .pred = pred,
+    baseline_type = baseline_type
+  )
+}
+
+# Compute all Stage 2 baseline predictions across validation folds
+baseline_types <- c("mean_sev", "median_sev", "zero_sev", "persistence_sev", "rolling_4wk_sev", "rolling_8wk_sev")
+naive_stage2_val_predictions <- list()
+
+for (baseline in baseline_types) {
+  cat("[Stage 2 Baseline] Computing", baseline, "predictions across validation folds...\n")
+  
+  # Get predictions for all folds
+  fold_preds <- purrr::map_dfr(pos_val_resamples$splits, ~ compute_stage2_baseline_fold(.x, baseline))
+  
+  # Compute pooled metrics (concatenated across all folds)
+  pooled_metrics <- tibble(
+    model = paste0("naive_", baseline),
+    mae = yardstick::mae_vec(fold_preds$truth, fold_preds$.pred),
+    rmse = yardstick::rmse_vec(fold_preds$truth, fold_preds$.pred),
+    rsq = yardstick::rsq_vec(fold_preds$truth, fold_preds$.pred)
+  )
+  
+  naive_stage2_val_predictions[[baseline]] <- pooled_metrics
+}
+
+# Combine all Stage 2 baseline results
+naive_stage2_val_summary <- bind_rows(naive_stage2_val_predictions) |>
+  arrange(rmse)  # Rank by RMSE by default
+
+cat("\n[Naive Baselines] Stage 2 (severity) validation set results (ranked by RMSE):\n")
+print(naive_stage2_val_summary)
+
+# Save Stage 2 validation baseline results (metric-agnostic filename)
+readr::write_csv(naive_stage2_val_summary, "model_outputs/tsr_naive_stage2_validation.csv")
+
+cat("\n[Naive Baselines] Stage 2 validation baselines saved.\n")
+```
+
+## Naive Baseline Comparisons: Combined (Two-Stage) Test Set
+
+```{r}
+#| label: naive-baselines-combined-test
+
+cat("\n[Naive Baselines] Computing combined two-stage test set baseline predictions...\n")
+
+# Compute baseline statistics from full pretest data
+train_occ_rate <- mean(pretest_df$y_occ == "yes", na.rm = TRUE)
+train_sev_mean <- mean(pretest_df$strike_count[pretest_df$strike_count > 0], na.rm = TRUE)
+train_sev_median <- median(pretest_df$strike_count[pretest_df$strike_count > 0], na.rm = TRUE)
+
+# Test set combined baselines
+naive_combined_test_results <- list()
+
+# 1. Mean occurrence × mean severity
+naive_combined_test_results$mean_combined <- tibble(
+  model = "naive_mean_combined",
+  mae = yardstick::mae_vec(test_df$strike_count, rep(train_occ_rate * train_sev_mean, nrow(test_df))),
+  rmse = yardstick::rmse_vec(test_df$strike_count, rep(train_occ_rate * train_sev_mean, nrow(test_df))),
+  rsq = yardstick::rsq_vec(test_df$strike_count, rep(train_occ_rate * train_sev_mean, nrow(test_df)))
+)
+
+# 2. Median occurrence × median severity
+naive_combined_test_results$median_combined <- tibble(
+  model = "naive_median_combined",
+  mae = yardstick::mae_vec(test_df$strike_count, rep(median(as.numeric(pretest_df$y_occ == "yes")) * train_sev_median, nrow(test_df))),
+  rmse = yardstick::rmse_vec(test_df$strike_count, rep(median(as.numeric(pretest_df$y_occ == "yes")) * train_sev_median, nrow(test_df))),
+  rsq = yardstick::rsq_vec(test_df$strike_count, rep(median(as.numeric(pretest_df$y_occ == "yes")) * train_sev_median, nrow(test_df)))
+)
+
+# 3. Persistence occurrence × persistence severity
+persistence_occ <- as.numeric(test_df$strike_count_lag1 > 0)
+persistence_sev <- test_df$strike_count_lag1
+persistence_combined <- persistence_occ * persistence_sev
+naive_combined_test_results$persistence_combined <- tibble(
+  model = "naive_persistence_combined",
+  mae = yardstick::mae_vec(test_df$strike_count, persistence_combined),
+  rmse = yardstick::rmse_vec(test_df$strike_count, persistence_combined),
+  rsq = yardstick::rsq_vec(test_df$strike_count, persistence_combined)
+)
+
+# 4. Zero baseline
+naive_combined_test_results$zero_combined <- tibble(
+  model = "naive_zero_combined",
+  mae = yardstick::mae_vec(test_df$strike_count, rep(0, nrow(test_df))),
+  rmse = yardstick::rmse_vec(test_df$strike_count, rep(0, nrow(test_df))),
+  rsq = NA_real_  # undefined for constant prediction
+)
+
+# 5. Rolling 4wk occurrence × rolling 4wk severity
+rolling_4wk_occ <- pmin(test_df$rolling_avg_4wk / pmax(test_df$rolling_avg_4wk + 1, 1), 1)
+rolling_4wk_sev <- test_df$rolling_avg_4wk
+rolling_4wk_combined <- rolling_4wk_occ * rolling_4wk_sev
+naive_combined_test_results$rolling_4wk_combined <- tibble(
+  model = "naive_rolling_4wk_combined",
+  mae = yardstick::mae_vec(test_df$strike_count, rolling_4wk_combined),
+  rmse = yardstick::rmse_vec(test_df$strike_count, rolling_4wk_combined),
+  rsq = yardstick::rsq_vec(test_df$strike_count, rolling_4wk_combined)
+)
+
+# 6. Rolling 8wk occurrence × rolling 8wk severity
+rolling_8wk_occ <- pmin(test_df$rolling_avg_8wk / pmax(test_df$rolling_avg_8wk + 1, 1), 1)
+rolling_8wk_sev <- test_df$rolling_avg_8wk
+rolling_8wk_combined <- rolling_8wk_occ * rolling_8wk_sev
+naive_combined_test_results$rolling_8wk_combined <- tibble(
+  model = "naive_rolling_8wk_combined",
+  mae = yardstick::mae_vec(test_df$strike_count, rolling_8wk_combined),
+  rmse = yardstick::rmse_vec(test_df$strike_count, rolling_8wk_combined),
+  rsq = yardstick::rsq_vec(test_df$strike_count, rolling_8wk_combined)
+)
+
+# Combine all combined baseline results
+naive_combined_test_summary <- bind_rows(naive_combined_test_results) |>
+  arrange(rmse)  # Rank by RMSE by default
+
+cat("\n[Naive Baselines] Combined (two-stage) test set results (ranked by RMSE):\n")
+print(naive_combined_test_summary)
+
+# Save combined test baseline results (metric-agnostic filename)
+readr::write_csv(naive_combined_test_summary, "model_outputs/tsr_naive_combined_test.csv")
+
+cat("\n[Naive Baselines] Combined test baselines saved. Comparison tables will be created during writeup.\n")
+
+cat("\n[Naive Baselines] All two-stage baseline comparisons complete!\n")
+```
+
+

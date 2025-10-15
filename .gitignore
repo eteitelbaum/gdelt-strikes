@@ -1,0 +1,18 @@
+# R specific
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# Large data files and directories
+data/
+gadm-boundaries/
+model_outputs/
+model-outputs/
+plots/
+
+# Service account credentials
+service-account.json
+
+# System files
+.DS_Store

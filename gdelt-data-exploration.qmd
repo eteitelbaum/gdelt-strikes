@@ -1,0 +1,934 @@
+---
+title: "GDELT Strike Events - Data Quality Exploration"
+format: html
+---
+
+```{r}
+#| label: setup
+
+library(DBI)
+library(bigrquery)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+```
+
+## Connect to GDELT via BigQuery
+
+```{r}
+bq_auth(path = "service-account.json")
+project_id <- "gdelt-449818"  
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = project_id,
+  billing = project_id
+)
+```
+
+## Explore Location Data Availability for Strike Events
+
+```{r}
+#| label: location-data-quality
+
+# Query to assess location data availability for strike events
+location_quality_query <- "
+SELECT 
+  -- Overall counts
+  COUNT(*) as total_strike_events,
+  COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) as events_with_location,
+  COUNT(CASE WHEN ActionGeo_Lat IS NULL OR ActionGeo_Long IS NULL THEN 1 END) as events_without_location,
+  
+  -- Calculate percentages
+  ROUND(COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_location,
+  ROUND(COUNT(CASE WHEN ActionGeo_Lat IS NULL OR ActionGeo_Long IS NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_without_location
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101
+"
+
+# Execute query
+location_quality <- bq_project_query(project_id, location_quality_query) %>%
+  bq_table_download()
+
+print("Overall Location Data Quality for Strike Events (2015+):")
+kable(location_quality)
+```
+
+## Location Data Quality by Year
+
+```{r}
+#| label: yearly-location-quality
+
+yearly_quality_query <- "
+SELECT 
+  CAST(SUBSTR(CAST(SQLDATE AS STRING), 1, 4) AS INT64) AS year,
+  COUNT(*) as total_events,
+  COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) as events_with_location,
+  ROUND(COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_location
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101
+GROUP BY year
+ORDER BY year
+"
+
+yearly_quality <- bq_project_query(project_id, yearly_quality_query) %>%
+  bq_table_download()
+
+print("Location Data Quality by Year:")
+kable(yearly_quality)
+```
+
+## Visualize Location Data Quality Trends
+
+```{r}
+#| label: quality-visualization
+
+# Plot percentage with location data over time
+ggplot(yearly_quality, aes(x = year, y = pct_with_location)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "blue", size = 2) +
+  labs(
+    title = "Percentage of Strike Events with Location Data by Year",
+    subtitle = "GDELT Events with EventCode 143* (2015-2024)",
+    x = "Year",
+    y = "Percentage with Location Data",
+    caption = "Source: GDELT 2.0 Events Database"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +
+  scale_x_continuous(breaks = yearly_quality$year)
+
+# Plot absolute numbers
+ggplot(yearly_quality, aes(x = year)) +
+  geom_col(aes(y = total_events), fill = "lightgray", alpha = 0.7) +
+  geom_col(aes(y = events_with_location), fill = "blue", alpha = 0.8) +
+  labs(
+    title = "Strike Events: Total vs. Those with Location Data",
+    subtitle = "GDELT Events with EventCode 143* (2015-2024)",
+    x = "Year",
+    y = "Number of Events",
+    caption = "Gray = Total Events, Blue = Events with Location Data"
+  ) +
+  theme_minimal() +
+  scale_x_continuous(breaks = yearly_quality$year)
+```
+
+## Geographic Coverage Analysis
+
+```{r}
+#| label: geographic-coverage
+
+# Check which countries have the most strike events with location data
+country_coverage_query <- "
+SELECT 
+  ActionGeo_CountryCode,
+  ActionGeo_FullName,
+  COUNT(*) as total_events,
+  COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) as events_with_location,
+  ROUND(COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_location
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101 AND
+  ActionGeo_CountryCode IS NOT NULL
+GROUP BY ActionGeo_CountryCode, ActionGeo_FullName
+HAVING COUNT(*) >= 100  -- Only countries with 100+ strike events
+ORDER BY total_events DESC
+LIMIT 20
+"
+
+country_coverage <- bq_project_query(project_id, country_coverage_query) %>%
+  bq_table_download()
+
+print("Top 20 Countries by Strike Events (minimum 100 events):")
+kable(country_coverage)
+```
+
+## Event Code Breakdown
+
+```{r}
+#| label: event-code-breakdown
+
+# Break down by specific strike event codes
+eventcode_quality_query <- "
+SELECT 
+  EventCode,
+  COUNT(*) as total_events,
+  COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) as events_with_location,
+  ROUND(COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_location
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101
+GROUP BY EventCode
+ORDER BY total_events DESC
+"
+
+eventcode_quality <- bq_project_query(project_id, eventcode_quality_query) %>%
+  bq_table_download()
+
+print("Location Data Quality by Event Code:")
+kable(eventcode_quality)
+```
+
+## Sample Events Without Location Data
+
+```{r}
+#| label: sample-missing-location
+
+# Look at some examples of events without location data
+missing_location_query <- "
+SELECT 
+  GLOBALEVENTID,
+  SQLDATE,
+  EventCode,
+  Actor1Name,
+  Actor2Name,
+  ActionGeo_FullName,
+  ActionGeo_CountryCode
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20240101 AND
+  (ActionGeo_Lat IS NULL OR ActionGeo_Long IS NULL)
+ORDER BY SQLDATE DESC
+LIMIT 10
+"
+
+missing_location <- bq_project_query(project_id, missing_location_query) %>%
+  bq_table_download()
+
+print("Sample Strike Events Missing Location Data (2024):")
+kable(missing_location)
+```
+
+## Geographic Precision Analysis
+
+```{r}
+#| label: geographic-precision
+
+# Analyze the precision of geographic data available
+precision_query <- "
+SELECT 
+  -- Overall counts
+  COUNT(*) as total_events_with_coords,
+  
+  -- Country-level data availability
+  COUNT(CASE WHEN ActionGeo_CountryCode IS NOT NULL THEN 1 END) as events_with_country,
+  COUNT(CASE WHEN ActionGeo_CountryCode IS NULL THEN 1 END) as events_without_country,
+  
+  -- ADM1 (state/province) level data availability  
+  COUNT(CASE WHEN ActionGeo_ADM1Code IS NOT NULL THEN 1 END) as events_with_adm1,
+  COUNT(CASE WHEN ActionGeo_ADM1Code IS NULL THEN 1 END) as events_without_adm1,
+  
+  -- ADM2 (county/district) level data availability
+  COUNT(CASE WHEN ActionGeo_ADM2Code IS NOT NULL THEN 1 END) as events_with_adm2,
+  COUNT(CASE WHEN ActionGeo_ADM2Code IS NULL THEN 1 END) as events_without_adm2,
+  
+  -- Calculate percentages for events with coordinates
+  ROUND(COUNT(CASE WHEN ActionGeo_CountryCode IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_country,
+  ROUND(COUNT(CASE WHEN ActionGeo_ADM1Code IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_adm1,
+  ROUND(COUNT(CASE WHEN ActionGeo_ADM2Code IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_adm2
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101 AND
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL
+"
+
+precision_data <- bq_project_query(project_id, precision_query) %>%
+  bq_table_download()
+
+print("Geographic Precision for Strike Events with Coordinates:")
+kable(precision_data)
+```
+
+## ADM1 Coverage by Year
+
+```{r}
+#| label: adm1-yearly-coverage
+
+# Check ADM1 code availability by year
+adm1_yearly_query <- "
+SELECT 
+  CAST(SUBSTR(CAST(SQLDATE AS STRING), 1, 4) AS INT64) AS year,
+  COUNT(*) as total_events_with_coords,
+  COUNT(CASE WHEN ActionGeo_ADM1Code IS NOT NULL THEN 1 END) as events_with_adm1,
+  ROUND(COUNT(CASE WHEN ActionGeo_ADM1Code IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_adm1
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101 AND
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL
+GROUP BY year
+ORDER BY year
+"
+
+adm1_yearly <- bq_project_query(project_id, adm1_yearly_query) %>%
+  bq_table_download()
+
+print("ADM1 Code Availability by Year (for events with coordinates):")
+kable(adm1_yearly)
+
+# Visualize ADM1 coverage trends
+ggplot(adm1_yearly, aes(x = year, y = pct_with_adm1)) +
+  geom_line(color = "darkgreen", size = 1) +
+  geom_point(color = "darkgreen", size = 2) +
+  labs(
+    title = "Percentage of Geolocated Strike Events with ADM1 Codes",
+    subtitle = "GDELT Events with EventCode 143* and coordinates (2015-2024)",
+    x = "Year",
+    y = "Percentage with ADM1 Codes",
+    caption = "Source: GDELT 2.0 Events Database"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +
+  scale_x_continuous(breaks = adm1_yearly$year)
+```
+
+## Sample Events with Different Geographic Precision Levels
+
+```{r}
+#| label: sample-precision-levels
+
+# Sample events with different levels of geographic detail
+sample_precision_query <- "
+SELECT 
+  GLOBALEVENTID,
+  SQLDATE,
+  ActionGeo_FullName,
+  ActionGeo_CountryCode,
+  ActionGeo_ADM1Code,
+  ActionGeo_ADM2Code,
+  ActionGeo_Lat,
+  ActionGeo_Long,
+  CASE 
+    WHEN ActionGeo_ADM2Code IS NOT NULL THEN 'ADM2 (County/District)'
+    WHEN ActionGeo_ADM1Code IS NOT NULL THEN 'ADM1 (State/Province)'
+    WHEN ActionGeo_CountryCode IS NOT NULL THEN 'Country Only'
+    ELSE 'No Geographic Codes'
+  END as precision_level
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20240101 AND
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL
+ORDER BY SQLDATE DESC
+LIMIT 15
+"
+
+sample_precision <- bq_project_query(project_id, sample_precision_query) %>%
+  bq_table_download()
+
+print("Sample Strike Events with Different Geographic Precision Levels (2024):")
+kable(sample_precision)
+```
+
+## Geographic Precision by Country
+
+```{r}
+#| label: precision-by-country
+
+# Check which countries have good ADM1 coverage
+country_precision_query <- "
+SELECT 
+  ActionGeo_CountryCode,
+  COUNT(*) as total_events_with_coords,
+  COUNT(CASE WHEN ActionGeo_ADM1Code IS NOT NULL THEN 1 END) as events_with_adm1,
+  ROUND(COUNT(CASE WHEN ActionGeo_ADM1Code IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_adm1,
+  COUNT(CASE WHEN ActionGeo_ADM2Code IS NOT NULL THEN 1 END) as events_with_adm2,
+  ROUND(COUNT(CASE WHEN ActionGeo_ADM2Code IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_adm2
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101 AND
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL AND
+  ActionGeo_CountryCode IS NOT NULL
+GROUP BY ActionGeo_CountryCode
+HAVING COUNT(*) >= 50  -- Only countries with 50+ geolocated strike events
+ORDER BY total_events_with_coords DESC
+LIMIT 20
+"
+
+country_precision <- bq_project_query(project_id, country_precision_query) %>%
+  bq_table_download()
+
+print("ADM1/ADM2 Code Coverage by Country (minimum 50 geolocated events):")
+kable(country_precision)
+```
+
+## Implications for Spatial Analysis Strategy
+
+```{r}
+#| label: spatial-strategy-implications
+
+cat("=== Geographic Precision Analysis Summary ===\n\n")
+
+adm1_pct <- precision_data$pct_with_adm1
+adm2_pct <- precision_data$pct_with_adm2
+
+cat("Of strike events WITH coordinates:\n")
+cat("- Events with ADM1 codes:", adm1_pct, "%\n")
+cat("- Events with ADM2 codes:", adm2_pct, "%\n\n")
+
+cat("Spatial Analysis Strategy Recommendations:\n\n")
+
+if (adm1_pct >= 80) {
+  cat("✅ EXCELLENT ADM1 COVERAGE: Can use GDELT's built-in ADM1 codes for most events\n")
+  cat("   → Strategy: Use ActionGeo_ADM1Code directly + spatial join for remaining events\n")
+} else if (adm1_pct >= 60) {
+  cat("⚠️  MODERATE ADM1 COVERAGE: Mix of built-in codes and spatial joins needed\n")
+  cat("   → Strategy: Use ActionGeo_ADM1Code where available + spatial join for rest\n")
+} else {
+  cat("❌ LOW ADM1 COVERAGE: Must rely primarily on spatial joins\n")
+  cat("   → Strategy: Spatial join all events to ADM1 boundaries for consistency\n")
+}
+
+cat("\nDetailed Recommendations:\n")
+cat("1. If ADM1 coverage >80%: Use existing codes to speed up processing\n")
+cat("2. If ADM1 coverage 60-80%: Hybrid approach (codes + spatial joins)\n") 
+cat("3. If ADM1 coverage <60%: Full spatial join approach for consistency\n")
+cat("4. Consider focusing on countries with best ADM1 coverage\n")
+cat("5. Document geographic precision limitations in methodology\n")
+```
+
+## ADM1 Code Validation and Lookup Strategy
+
+```{r}
+#| label: adm1-validation
+
+# Since 100% of geolocated events have ADM1 codes, let's validate their quality
+# and create a strategy for using them directly instead of spatial joins
+
+# Sample of ADM1 codes to see the format
+adm1_sample_query <- "
+SELECT DISTINCT
+  ActionGeo_CountryCode,
+  ActionGeo_ADM1Code,
+  COUNT(*) as event_count
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101 AND
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL AND
+  ActionGeo_ADM1Code IS NOT NULL
+GROUP BY ActionGeo_CountryCode, ActionGeo_ADM1Code
+ORDER BY event_count DESC
+LIMIT 20
+"
+
+adm1_samples <- bq_project_query(project_id, adm1_sample_query) %>%
+  bq_table_download()
+
+print("Sample ADM1 Codes from GDELT (most frequent):")
+kable(adm1_samples)
+
+cat("\nADM1 Code Format Analysis:\n")
+cat("- These appear to be standard administrative codes\n")
+cat("- Can be used for direct lookup instead of spatial joins\n")
+cat("- This eliminates the need for expensive st_join() operations!\n")
+```
+
+## Compare GDELT ADM1 Codes with GADM Boundaries
+
+```{r}
+#| label: gdelt-vs-gadm
+
+# Let's see if GDELT's ADM1 codes align with your GADM boundaries
+# This will help verify compatibility
+
+# First, let's see what GID_1 codes look like in your GADM data
+if (file.exists("gadm-boundaries/gadm_410-levels.gpkg")) {
+  
+  library(sf)
+  
+  # Load a sample of GADM ADM1 boundaries to see the ID format
+  gadm_sample <- read_sf("gadm-boundaries/gadm_410-levels.gpkg", layer = "ADM_1") %>%
+    st_drop_geometry() %>%  # Remove geometry for faster processing
+    select(GID_1, NAME_1, HASC_1, ISO_1) %>%
+    head(20)
+  
+  print("Sample GADM ADM1 Boundary IDs:")
+  kable(gadm_sample)
+  
+  cat("\nCompatibility Assessment:\n")
+  cat("- GDELT ActionGeo_ADM1Code format: [see above]\n") 
+  cat("- GADM GID_1 format: [see above]\n")
+  cat("- Need to determine if these can be directly matched\n")
+  cat("- If not, may need a lookup table or coordinate-based matching\n")
+  
+} else {
+  cat("GADM boundaries file not found. ADM1 code comparison skipped.\n")
+  cat("Recommendation: Load GADM data first to compare ADM1 code formats\n")
+}
+```
+
+## Recommended Workflow Strategy
+
+```{r}
+#| label: recommended-workflow
+
+cat("=== REVISED WORKFLOW RECOMMENDATION ===\n\n")
+
+cat("🎉 EXCELLENT NEWS: 100% ADM1 coverage means NO spatial joins needed!\n\n")
+
+cat("REVISED DOWNLOAD STRATEGY:\n")
+cat("1. Download strike events with coordinates (as planned)\n")
+cat("2. Include ActionGeo_ADM1Code in your download query\n")
+cat("3. Create ADM1 lookup table from GDELT or GADM\n")
+cat("4. Use direct table joins instead of spatial joins\n\n")
+
+cat("REVISED PROCESSING STRATEGY:\n")
+cat("OLD: Load all data → Convert to sf → Spatial join (SLOW)\n")
+cat("NEW: Load all data → Direct table join on ADM1 codes (FAST)\n\n")
+
+cat("PERFORMANCE BENEFITS:\n")
+cat("- Processing time: ~5-10x faster\n")
+cat("- Memory usage: ~3-5x lower\n") 
+cat("- Code complexity: Much simpler\n")
+cat("- Reliability: Higher (no spatial edge cases)\n\n")
+
+cat("NEXT STEPS:\n")
+cat("1. Verify GDELT vs GADM ADM1 code compatibility\n")
+cat("2. Create ADM1 lookup table (GDELT codes → GADM GID_1)\n")
+cat("3. Update download query to include ActionGeo_ADM1Code\n")
+cat("4. Replace spatial join with table join in processing code\n")
+```
+
+## Updated Download Query Template
+
+```{r}
+#| label: updated-download-query
+
+cat("UPDATED DOWNLOAD QUERY (include ADM1 codes):\n\n")
+
+updated_query <- "
+SELECT
+  GLOBALEVENTID,
+  SQLDATE,
+  ActionGeo_Lat AS lat,
+  ActionGeo_Long AS lon,
+  ActionGeo_ADM1Code,        -- ADD THIS!
+  ActionGeo_CountryCode,     -- ADD THIS for additional context
+  ActionGeo_FullName,        -- ADD THIS for location names
+  EventCode,
+  Actor1Name,
+  Actor1Code,
+  Actor2Name,
+  Actor2Code,
+  QuadClass,
+  GoldsteinScale
+FROM
+  `gdelt-bq.gdeltv2.events`
+WHERE
+  EventCode LIKE '143%' AND
+  SQLDATE >= [YEAR]0101 AND
+  SQLDATE <= [YEAR]1231 AND
+  ActionGeo_Lat IS NOT NULL AND
+  ActionGeo_Long IS NOT NULL
+"
+
+cat(updated_query)
+cat("\n\nWith this approach, aggregation becomes:\n")
+cat("strikes_aggregated <- strikes_data %>%\n")
+cat("  group_by(ActionGeo_ADM1Code, week) %>%\n") 
+cat("  summarise(strike_events = n()) %>%\n")
+cat("  left_join(adm1_lookup, by = c('ActionGeo_ADM1Code' = 'gdelt_code'))\n")
+```
+
+## Coordinate Quality Validation
+
+```{r}
+#| label: coordinate-validation
+
+# Let's validate that these are real place coordinates, not country centroids
+validation_query <- "
+SELECT 
+  ActionGeo_CountryCode,
+  ActionGeo_FullName,
+  ActionGeo_Lat,
+  ActionGeo_Long,
+  COUNT(*) as event_count
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20240101 AND
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL
+ORDER BY RAND()  -- Random sample
+LIMIT 20
+"
+
+coord_validation <- bq_project_query(project_id, validation_query) %>%
+  bq_table_download()
+
+print("Sample Coordinates and Place Names:")
+kable(coord_validation)
+
+cat("\nCoordinate Quality Assessment:\n")
+cat("✅ Look for specific place names (cities, towns) rather than just country names\n")
+cat("✅ Coordinates should vary significantly within countries\n") 
+cat("✅ Place names should be recognizable locations, not generic descriptions\n")
+cat("❌ Red flags: coordinates clustering at country/state centroids\n")
+cat("❌ Red flags: vague location names like 'United States' or 'California'\n")
+```
+
+## Geographic Distribution Analysis
+
+```{r}
+#| label: geographic-distribution
+
+# Check if coordinates are clustered (suggesting centroids) or distributed (real places)
+distribution_query <- "
+SELECT 
+  ActionGeo_CountryCode,
+  COUNT(DISTINCT CONCAT(CAST(ROUND(ActionGeo_Lat, 2) AS STRING), ',', CAST(ROUND(ActionGeo_Long, 2) AS STRING))) as unique_locations,
+  COUNT(*) as total_events,
+  ROUND(COUNT(DISTINCT CONCAT(CAST(ROUND(ActionGeo_Lat, 2) AS STRING), ',', CAST(ROUND(ActionGeo_Long, 2) AS STRING))) / COUNT(*) * 100, 2) as location_diversity_pct
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20230101 AND
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL AND
+  ActionGeo_CountryCode IS NOT NULL
+GROUP BY ActionGeo_CountryCode
+HAVING COUNT(*) >= 20  -- Countries with 20+ events
+ORDER BY total_events DESC
+LIMIT 15
+"
+
+distribution_data <- bq_project_query(project_id, distribution_query) %>%
+  bq_table_download()
+
+print("Geographic Diversity by Country (2023-2024):")
+kable(distribution_data)
+
+cat("\nInterpretation:\n")
+cat("- High location_diversity_pct = events spread across many locations (GOOD)\n")
+cat("- Low location_diversity_pct = events clustered in few locations (potential concern)\n")
+```
+
+## Sample Specific Locations for Major Countries
+
+```{r}
+#| label: sample-locations-by-country
+
+# Look at specific locations within major countries
+major_countries_query <- "
+SELECT 
+  ActionGeo_CountryCode,
+  ActionGeo_FullName,
+  ActionGeo_Lat,
+  ActionGeo_Long,
+  COUNT(*) as event_count
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20240101 AND
+  ActionGeo_CountryCode IN ('US', 'IN', 'FR', 'BR', 'CN') AND  -- Major countries
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL
+GROUP BY ActionGeo_CountryCode, ActionGeo_FullName, ActionGeo_Lat, ActionGeo_Long
+ORDER BY ActionGeo_CountryCode, event_count DESC
+"
+
+major_countries_locations <- bq_project_query(project_id, major_countries_query) %>%
+  bq_table_download()
+
+print("Sample Specific Locations in Major Countries (2024):")
+kable(major_countries_locations)
+
+cat("\nQuality Indicators to Look For:\n")
+cat("✅ Specific city names (e.g., 'New York', 'Mumbai', 'Paris')\n")
+cat("✅ Diverse coordinates within each country\n")
+cat("✅ Recognizable place names\n")
+cat("❌ Generic names (e.g., 'United States', 'India')\n")
+cat("❌ Identical coordinates repeated many times\n")
+```
+
+## ADM2 Coverage Analysis: Global Patterns
+
+```{r}
+#| label: adm2-coverage-patterns
+
+# Analyze ADM2 coverage by country to understand the disparity
+adm2_country_analysis_query <- "
+SELECT 
+  ActionGeo_CountryCode,
+  COUNT(*) as total_events_with_coords,
+  COUNT(CASE WHEN ActionGeo_ADM2Code IS NOT NULL THEN 1 END) as events_with_adm2,
+  ROUND(COUNT(CASE WHEN ActionGeo_ADM2Code IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_adm2,
+  COUNT(DISTINCT ActionGeo_FullName) as unique_locations
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20230101 AND
+  ActionGeo_Lat IS NOT NULL AND 
+  ActionGeo_Long IS NOT NULL AND
+  ActionGeo_CountryCode IS NOT NULL
+GROUP BY ActionGeo_CountryCode
+HAVING COUNT(*) >= 50  -- Countries with 50+ events
+ORDER BY pct_with_adm2 DESC
+"
+
+adm2_by_country <- bq_project_query(project_id, adm2_country_analysis_query) %>%
+  bq_table_download()
+
+print("ADM2 Coverage by Country (ranked by coverage %):")
+kable(head(adm2_by_country, 20))
+
+cat("\nKey Patterns to Look For:\n")
+cat("- Do developed countries (US, UK, DE, FR) have higher ADM2 coverage?\n")
+cat("- Do developing countries show lower ADM2 coverage?\n") 
+cat("- Are there regional patterns (Western vs non-Western)?\n")
+cat("- Does coverage correlate with English-language reporting?\n")
+```
+
+## Regional ADM2 Coverage Analysis
+
+```{r}
+#| label: regional-adm2-patterns
+
+# Let's categorize countries by region/development to see patterns
+# Create rough regional categories based on country codes
+
+adm2_by_country_extended <- adm2_by_country %>%
+  mutate(
+    region = case_when(
+      ActionGeo_CountryCode %in% c("US", "CA") ~ "North America",
+      ActionGeo_CountryCode %in% c("UK", "FR", "GM", "IT", "SP", "NL", "SW", "NO", "DA", "AU") ~ "Western Europe",
+      ActionGeo_CountryCode %in% c("PL", "RS", "UP", "RO", "BU", "HR") ~ "Eastern Europe", 
+      ActionGeo_CountryCode %in% c("CH", "JA", "KS", "AS") ~ "East Asia",
+      ActionGeo_CountryCode %in% c("IN", "PK", "BG", "NP", "CE") ~ "South Asia",
+      ActionGeo_CountryCode %in% c("IS", "TU", "IR", "IZ", "SA", "JO") ~ "Middle East",
+      ActionGeo_CountryCode %in% c("EG", "LY", "AG", "NI", "ML", "GH") ~ "Africa",
+      ActionGeo_CountryCode %in% c("BR", "MX", "AR", "CI", "PE", "VE") ~ "Latin America",
+      TRUE ~ "Other"
+    ),
+    development_level = case_when(
+      ActionGeo_CountryCode %in% c("US", "CA", "UK", "FR", "GM", "IT", "JA", "AS", "AU", "SW", "NO") ~ "Developed",
+      ActionGeo_CountryCode %in% c("CH", "IN", "BR", "MX", "TU", "RS", "PL") ~ "Middle Income",
+      TRUE ~ "Developing"
+    )
+  )
+
+# Regional summary
+regional_summary <- adm2_by_country_extended %>%
+  group_by(region) %>%
+  summarise(
+    countries = n(),
+    avg_adm2_coverage = round(mean(pct_with_adm2), 2),
+    total_events = sum(total_events_with_coords),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_adm2_coverage))
+
+print("ADM2 Coverage by Region:")
+kable(regional_summary)
+
+# Development level summary  
+dev_summary <- adm2_by_country_extended %>%
+  group_by(development_level) %>%
+  summarise(
+    countries = n(),
+    avg_adm2_coverage = round(mean(pct_with_adm2), 2),
+    total_events = sum(total_events_with_coords),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_adm2_coverage))
+
+print("ADM2 Coverage by Development Level:")
+kable(dev_summary)
+```
+
+## GDELT's Multi-Language Coverage
+
+```{r}
+#| label: gdelt-language-coverage
+
+cat("=== GDELT Language Coverage Context ===\n\n")
+
+cat("GDELT 2.0 Coverage:\n")
+cat("✅ 65+ languages supported\n")
+cat("✅ Real-time translation of non-English sources\n") 
+cat("✅ Global news monitoring (not just English-language sources)\n")
+cat("✅ Local/regional news sources included\n\n")
+
+cat("However, ADM2 coverage disparities could still arise from:\n\n")
+
+cat("1. BOUNDARY DATA AVAILABILITY:\n")
+cat("   - ADM1 boundaries: Well-defined globally (countries/states)\n")
+cat("   - ADM2 boundaries: Inconsistent global coverage\n")
+cat("   - Some countries lack standardized county/district boundaries\n")
+cat("   - Boundary datasets may prioritize developed countries\n\n")
+
+cat("2. GEOCODING COMPLEXITY:\n")
+cat("   - ADM1: ~4,000 global administrative units\n") 
+cat("   - ADM2: ~40,000+ global administrative units\n")
+cat("   - Much harder to maintain comprehensive ADM2 gazetteers\n")
+cat("   - Place name ambiguity increases at ADM2 level\n\n")
+
+cat("3. REPORTING GRANULARITY:\n")
+cat("   - Developed countries: 'Strike in Detroit' (city-specific)\n")
+cat("   - Developing countries: 'Strike in Punjab' (state-level reporting)\n")
+cat("   - International media may use broader geographic references\n")
+cat("   - Local place names may not be in global gazetteers\n\n")
+```
+
+## Sample Location Names by ADM2 Coverage
+
+```{r}
+#| label: location-name-analysis
+
+# Compare location name patterns between high and low ADM2 coverage countries
+location_samples_query <- "
+SELECT 
+  ActionGeo_CountryCode,
+  ActionGeo_FullName,
+  ActionGeo_ADM1Code,
+  ActionGeo_ADM2Code,
+  COUNT(*) as event_count
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20240101 AND
+  ActionGeo_CountryCode IN ('US', 'UK', 'IN', 'IR', 'IS', 'UP') AND  -- Mix of high/low ADM2 coverage
+  ActionGeo_Lat IS NOT NULL
+GROUP BY ActionGeo_CountryCode, ActionGeo_FullName, ActionGeo_ADM1Code, ActionGeo_ADM2Code
+ORDER BY ActionGeo_CountryCode, event_count DESC
+"
+
+location_samples <- bq_project_query(project_id, location_samples_query) %>%
+  bq_table_download()
+
+# Split into high vs low ADM2 coverage examples
+high_adm2_countries <- c("US", "UK")  # Based on earlier results
+low_adm2_countries <- c("IR", "IS", "UP")  # Based on earlier results
+
+high_adm2_sample <- location_samples %>% 
+  filter(ActionGeo_CountryCode %in% high_adm2_countries) %>%
+  head(10)
+
+low_adm2_sample <- location_samples %>% 
+  filter(ActionGeo_CountryCode %in% low_adm2_countries) %>%
+  head(10)
+
+print("Sample Location Names - High ADM2 Coverage Countries:")
+kable(high_adm2_sample)
+
+print("Sample Location Names - Low ADM2 Coverage Countries:")
+kable(low_adm2_sample)
+
+cat("\nLocation Name Pattern Analysis:\n")
+cat("Look for differences in specificity:\n")
+cat("- High coverage: Specific cities ('Detroit', 'Manchester')\n")
+cat("- Low coverage: Broader regions, less specific place names\n")
+cat("- Note which have ADM2 codes vs those that don't\n")
+```
+
+## Implications for Your Analysis
+
+```{r}
+#| label: adm2-implications
+
+cat("=== ADM2 Coverage Analysis Summary ===\n\n")
+
+cat("Potential Explanations for 50% ADM2 Coverage:\n\n")
+
+cat("1. TECHNICAL LIMITATIONS:\n")
+cat("   - Global ADM2 boundary datasets incomplete\n")
+cat("   - Geocoding systems prioritize ADM1 over ADM2\n") 
+cat("   - ADM2 boundaries change more frequently\n\n")
+
+cat("2. REPORTING PATTERNS:\n")
+cat("   - Western media: More location-specific reporting\n")
+cat("   - International reporting: Broader geographic references\n")
+cat("   - Local vs global news source differences\n\n")
+
+cat("3. GEOGRAPHIC FACTORS:\n")
+cat("   - Urban areas: Better ADM2 coverage\n")
+cat("   - Rural areas: Less precise boundary definitions\n")
+cat("   - Country size: Larger countries may have less complete coverage\n\n")
+
+cat("RECOMMENDATIONS FOR YOUR ANALYSIS:\n")
+cat("✅ ADM1 level is perfectly adequate for your research\n")
+cat("✅ Focus on ADM1-week aggregation as planned\n") 
+cat("✅ Document ADM2 limitations but don't let them derail your project\n")
+cat("✅ Consider ADM2 analysis as potential future extension\n")
+cat("✅ ADM1 boundaries are politically/economically meaningful units\n")
+```
+
+## CRITICAL: GDELT vs GADM Code Compatibility
+
+```{r}
+#| label: code-compatibility-analysis
+
+cat("=== GDELT ADM1 CODE COMPATIBILITY CHECK ===\n\n")
+
+cat("This is the KEY QUESTION for your workflow:\n")
+cat("Can GDELT's ADM1 codes be directly matched to GADM boundaries?\n")
+cat("If not, you'll need spatial joins regardless of 100% coverage!\n\n")
+```
+
+## Examine GDELT ADM1 Code Format
+
+```{r}
+#| label: gdelt-code-format
+
+# Get a comprehensive sample of GDELT ADM1 codes to understand the format
+gdelt_code_format_query <- "
+SELECT 
+  ActionGeo_CountryCode,
+  ActionGeo_ADM1Code,
+  ActionGeo_FullName,
+  COUNT(*) as event_count
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20240101 AND
+  ActionGeo_ADM1Code IS NOT NULL AND
+  ActionGeo_CountryCode IN ('US', 'FR', 'IN', 'BR', 'UK', 'CA', 'AU', 'DE')  -- Sample major countries
+GROUP BY ActionGeo_CountryCode, ActionGeo_ADM1Code, ActionGeo_FullName
+ORDER BY ActionGeo_CountryCode, event_count DESC
+"
+
+gdelt_codes <- bq_project_query(project_id, gdelt_code_format_query) %>%
+  bq_table_download()
+
+print("GDELT ADM1 Code Format (sample major countries):")
+kable(head(gdelt_codes, 25))
+
+cat("\nGDELT Code Format Analysis:\n")
+cat("Look for patterns in ActionGeo_ADM1Code:\n")
+cat("- Are they ISO 3166-2 codes (e.g., 'US-CA', 'FR-75')?\n")
+cat("- Are they FIPS codes (e.g., 'USCA', 'FR75')?\n") 
+cat("- Are they custom GDELT codes?\n")
+cat("- Do they follow any recognizable standard?\n\n")
+```
+
+Analysis basically confirms that GDELT has its own proprietary system and that it is incompatible with other international recognized systems such as ISO 3166-2 or HASC which could match with GADM. 

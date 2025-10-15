@@ -1,0 +1,737 @@
+---
+title: "Two-Stage Strike Forecasting Analysis"
+format: html
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidymodels)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(bonsai)
+library(finetune)
+library(themis)
+library(janitor)
+library(doFuture)   # Parallel backend for tune_grid via foreach/future
+library(vip)
+
+tidymodels_prefer()
+conflicted::conflicts_prefer(dplyr::lag)
+conflicted::conflicts_prefer(stringr::fixed)
+set.seed(2024)
+
+# Parallel tuning setup (Apple Silicon safe)
+# We parallelize the OUTER loop (resamples × grid) and restrict per-model threads to avoid oversubscription.
+# Adjust workers if you see high RAM/CPU: 2–4 is a good range on M1.
+registerDoFuture()
+plan(multisession, workers = 4)  # 3–4 workers often OK on Apple Silicon; reduce if RAM pressure
+
+# Allow larger globals transfer to workers (resample objects can be large)
+options(future.globals.maxSize = 8 * 1024^3)  # 8 GiB
+
+# Racing control is created after resamples are defined so burn-in can adapt
+ctrl_race <- NULL
+```
+
+## Load data
+
+```{r}
+#| label: load-data
+
+adm_full <- read_parquet("data/analysis/adm_week_full.parquet") |>
+  clean_names()
+
+glimpse(adm_full)
+```
+
+## Targets and predictors
+
+```{r}
+#| label: targets-predictors
+
+# Occurrence target
+adm_full <- adm_full |>
+  mutate(y_occ = factor(if_else(strike_count > 0, "yes", "no"), levels = c("no", "yes")))
+
+# Predictor set: lag-only + time + spatial (avoid contemporaneous leakage)
+predictor_cols <- adm_full |>
+  select(
+    # IDs
+    action_geo_adm1_code, action_geo_country_code,
+    # time
+    time_trend, year_sin, year_cos, month, quarter, is_year_end,
+    # lagged counts & rolling
+    strike_count_lag1, strike_count_lag2, strike_count_lag4,
+    rolling_avg_4wk, rolling_avg_8wk,
+    # media/tone lags
+    total_articles_lag1, total_articles_lag2,
+    total_mentions_lag1, total_mentions_lag2,
+    avg_tone_lag1, avg_tone_lag2,
+    # actor lags
+    actor_diversity_lag1,
+    unique_actor1_types_lag1, unique_actor2_types_lag1,
+    prop_gov_lag1, prop_labor_lag1, prop_civil_lag1,
+    # spatial lags
+    country_strikes_lag1, contig_strikes_t1, distw_strikes_t1
+  ) |>
+  names()
+
+model_df <- adm_full |>
+  select(date, strike_count, y_occ, all_of(predictor_cols)) |>
+  arrange(date)
+
+# Severity subset (positive weeks only), after feature construction
+severity_df <- model_df |>
+  filter(strike_count > 0)
+```
+
+## Time splits: rolling-origin CV + final 52-week holdout
+
+```{r}
+#| label: splits
+
+all_weeks <- sort(unique(model_df$date))
+test_weeks <- tail(all_weeks, 52)
+
+pretest_df <- model_df |>
+  filter(date < min(test_weeks))
+test_df <- model_df |>
+  filter(date %in% test_weeks)
+
+# Build rolling-origin splits on pretest period (3 folds × 26-week assessments)
+assessment_weeks <- 26
+n_folds <- 3
+
+pretest_max <- max(pretest_df$date)
+assess_end_dates <- pretest_max - weeks(rev(seq(0, by = assessment_weeks, length.out = n_folds)))
+assess_start_dates <- assess_end_dates - weeks(assessment_weeks - 1)
+
+cap_weeks <- 156  # cap analysis window to last N weeks (~3 years)
+
+make_time_split <- function(df, start_date, end_date) {
+  window_start <- start_date - weeks(cap_weeks)
+  analysis_idx <- which(df$date >= window_start & df$date < start_date)
+  assessment_idx <- which(df$date >= start_date & df$date <= end_date)
+  rsample::make_splits(list(analysis = analysis_idx, assessment = assessment_idx), df)
+}
+
+val_splits <- map2(assess_start_dates, assess_end_dates, ~ make_time_split(pretest_df, .x, .y))
+val_resamples <- rsample::manual_rset(val_splits, paste0("fold", seq_along(val_splits)))
+
+cat("Validation folds:", nrow(val_resamples), "(assessment window", assessment_weeks, "weeks)\n")
+```
+
+## Recipes
+
+```{r}
+#| label: recipes
+
+# Common preprocessor (dummy categorical, numeric median impute, encode logical)
+base_recipe <- recipe(~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+
+# Occurrence recipes (predict y_occ)
+# - Downsampled for Logistic/RF
+# - Weighted (no downsample) for XGB/LGBM
+occ_recipe_down <- base_recipe |>
+  update_role(y_occ, new_role = "outcome") |>
+  step_rm(strike_count) |>
+  step_downsample(y_occ, under_ratio = 5)
+
+occ_recipe_wt <- base_recipe |>
+  update_role(y_occ, new_role = "outcome") |>
+  step_rm(strike_count)
+
+# Severity recipes: define explicitly so `y_occ` is removed BEFORE dummying
+sev_recipe_log <- recipe(strike_count ~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_rm(y_occ) |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_log(strike_count, offset = 1, skip = TRUE)
+
+sev_recipe_tree <- recipe(strike_count ~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_rm(y_occ) |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+```
+
+## Model specifications
+
+```{r}
+#| label: model-specs
+
+# Stage 1: Occurrence (classification)
+# Compute imbalance weight for XGBoost on pretest data
+pos_count <- sum(pretest_df$y_occ == "yes")
+neg_count <- sum(pretest_df$y_occ == "no")
+scale_pos_wt <- ifelse(pos_count > 0, neg_count / pos_count, 1)
+log_reg_spec <- logistic_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("classification")
+
+rf_clf_spec <- rand_forest(trees = 500, mtry = tune(), min_n = tune()) |>
+  set_engine("ranger", classification = TRUE, num.threads = 1) |>
+  set_mode("classification")
+
+xgb_clf_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("xgboost", objective = "binary:logistic", tree_method = "hist", nthread = 1, scale_pos_weight = !!scale_pos_wt) |>
+  set_mode("classification")
+
+lgb_clf_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("lightgbm", objective = "binary", metric = "aucpr", num_threads = 1, is_unbalance = TRUE) |>
+  set_mode("classification")
+
+# Stage 2: Severity (regression)
+lm_log_spec <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression")
+
+xgb_poi_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("xgboost", objective = "count:poisson", tree_method = "hist", nthread = 1) |>
+  set_mode("regression")
+
+lgb_poi_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("lightgbm", objective = "poisson", num_threads = 1) |>
+  set_mode("regression")
+
+lgb_twd_spec <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_engine("lightgbm", objective = "tweedie", tweedie_variance_power = 1.5, num_threads = 1) |>
+  set_mode("regression")
+
+# Grids
+# Separate grids so each model only receives parameters it supports
+grid_boosted <- grid_space_filling(
+  trees(range = c(200, 600)),
+  tree_depth(range = c(3, 8)),
+  min_n(range = c(2, 20)),
+  loss_reduction(range = c(0, 5)),
+  sample_size = sample_prop(range = c(0.6, 0.9)),
+  mtry(range = c(2, min(12, length(predictor_cols)))),
+  learn_rate(range = c(-3, -1), trans = log10_trans()),
+  size = 12
+)
+
+grid_rf <- grid_space_filling(
+  mtry(range = c(5, 12)),
+  min_n(range = c(2, 20)),
+  size = 12
+)
+
+lambda_grid <- grid_regular(penalty(range = c(-5, 0)), levels = 10)
+```
+
+## Workflows
+
+```{r}
+#| label: workflows
+
+occ_workflows <- list(
+  log_reg = workflow() |> add_model(log_reg_spec) |> add_recipe(occ_recipe_down),
+  rf = workflow() |> add_model(rf_clf_spec) |> add_recipe(occ_recipe_down),
+  xgb = workflow() |> add_model(xgb_clf_spec) |> add_recipe(occ_recipe_wt),
+  lgb = workflow() |> add_model(lgb_clf_spec) |> add_recipe(occ_recipe_wt)
+)
+
+sev_workflows <- list(
+  lm_log = workflow() |> add_model(lm_log_spec) |> add_recipe(sev_recipe_log),
+  xgb_poi = workflow() |> add_model(xgb_poi_spec) |> add_recipe(sev_recipe_tree),
+  lgb_poi = workflow() |> add_model(lgb_poi_spec) |> add_recipe(sev_recipe_tree),
+  lgb_twd = workflow() |> add_model(lgb_twd_spec) |> add_recipe(sev_recipe_tree)
+)
+```
+
+## Tuning and evaluation on rolling folds
+
+```{r}
+#| label: tuning-eval
+#| cache: false
+
+# Metrics (use F2 for recall emphasis)
+f_meas2 <- yardstick::metric_tweak("f_meas2", yardstick::f_meas, beta = 2)
+# Force positive class to be "yes" (second level) for AUC metrics
+pr_auc_yes <- yardstick::metric_tweak("pr_auc", yardstick::pr_auc, event_level = "second")
+roc_auc_yes <- yardstick::metric_tweak("roc_auc", yardstick::roc_auc, event_level = "second")
+# Keep combined metrics for tuning (AUCs computed for positive class = "yes")
+clf_metrics <- metric_set(pr_auc_yes, roc_auc_yes, f_meas2)
+# Separate prob- and class-based sets for fold evaluation to avoid mixed mappings
+clf_metrics_prob <- metric_set(pr_auc_yes, roc_auc_yes)
+clf_metrics_class <- metric_set(f_meas2)
+# Put RMSE first so the race and ranking metric agree
+reg_metrics <- metric_set(rmse, mae, rsq)
+
+# Tune classifiers
+# Create racing control after resamples so burn-in < nrow(val_resamples)
+ctrl_race <- control_race(
+  save_pred = FALSE,
+  verbose = TRUE,
+  allow_par = TRUE,
+  parallel_over = "resamples",
+  save_workflow = FALSE,
+  burn_in = max(1, min(2, nrow(val_resamples) - 1))
+)
+tuned_clf <- imap(occ_workflows, function(wf, name) {
+  cat("[Stage 1] Tuning classifier:", name, "\n")
+  res <- if (name == "log_reg") {
+    tune_race_anova(wf, resamples = val_resamples, grid = lambda_grid, metrics = clf_metrics,
+                    control = ctrl_race)
+  } else if (name == "rf") {
+    tune_race_anova(wf, resamples = val_resamples, grid = grid_rf, metrics = clf_metrics,
+                    control = ctrl_race)
+  } else {
+    tune_race_anova(wf, resamples = val_resamples, grid = grid_boosted, metrics = clf_metrics,
+                    control = ctrl_race)
+  }
+  cat("[Stage 1] Completed classifier:", name, "\n")
+  res
+})
+
+# Inspect tuning notes for failures/warnings (optional)
+try({
+  show_notes(.Last.tune.result)
+}, silent = TRUE)
+
+# Tune regressors (on positive weeks only within each fold)
+# Build positive-only resamples mirroring val_resamples by dates
+pos_pretest_df <- pretest_df |>
+  filter(strike_count > 0)
+
+map_split_to_pos <- function(split) {
+  analysis_dates <- rsample::analysis(split)$date
+  assessment_dates <- rsample::assessment(split)$date
+  pos_analysis_idx <- which(pos_pretest_df$date %in% analysis_dates)
+  pos_assessment_idx <- which(pos_pretest_df$date %in% assessment_dates)
+  rsample::make_splits(list(analysis = pos_analysis_idx, assessment = pos_assessment_idx), pos_pretest_df)
+}
+
+pos_val_splits <- purrr::map(val_resamples$splits, map_split_to_pos)
+pos_val_resamples <- rsample::manual_rset(pos_val_splits, val_resamples$id)
+
+tuned_reg <- imap(sev_workflows, function(wf, name) {
+  if (name == "lm_log") {
+    cat("[Stage 2] Skipping tuning for:", name, "(no hyperparameters)\n")
+    list(workflow = wf)
+  } else {
+    cat("[Stage 2] Tuning regressor:", name, "\n")
+    res <- tune_race_anova(wf, resamples = pos_val_resamples, grid = grid_boosted, metrics = reg_metrics,
+                           control = ctrl_race)
+    cat("[Stage 2] Completed regressor:", name, "\n")
+    res
+  }
+})
+
+# Select best per model
+best_clf <- imap(tuned_clf, ~ select_best(.x, metric = "pr_auc"))
+cat("[Stage 1] Selected best hyperparameters for all classifiers (metric=pr_auc).\n")
+
+# Use workflow names from imap (.y) to index best_clf, not cur_group_id()
+finalized_clf <- imap(occ_workflows, ~ finalize_workflow(.x, best_clf[[.y]]))
+
+finalized_reg <- list(
+  lm_log = sev_workflows$lm_log,
+  xgb_poi = finalize_workflow(sev_workflows$xgb_poi, select_best(tuned_reg$xgb_poi, metric = "rmse")),
+  lgb_poi = finalize_workflow(sev_workflows$lgb_poi, select_best(tuned_reg$lgb_poi, metric = "rmse")),
+  lgb_twd = finalize_workflow(sev_workflows$lgb_twd, select_best(tuned_reg$lgb_twd, metric = "rmse"))
+)
+
+# Helper to predict severity for positive weeks and back-transform if needed
+predict_severity <- function(fit, new_data, model_name) {
+  if (model_name == "lm_log") {
+    pred_log <- predict(fit, new_data = new_data)$.pred
+    pred <- pmax(expm1(pred_log), 0)
+    pred[is.na(pred)] <- 0
+    pred
+  } else {
+    pred <- predict(fit, new_data = new_data)$.pred
+    pred[is.na(pred)] <- 0
+    pred
+  }
+}
+
+# Print per-fold metrics for selected configs before moving on
+cat("\n[Stage 1] Per-fold metrics for best classifiers:\n")
+clf_fold_metrics <- purrr::imap_dfr(tuned_clf, function(res, name) {
+  best_cfg <- best_clf[[name]]$.config
+  tune::collect_metrics(res, summarize = FALSE) |>
+    dplyr::filter(.config == best_cfg, .metric %in% c("pr_auc", "roc_auc", "f_meas2")) |>
+    dplyr::select(id, .metric, .estimate) |>
+    tidyr::pivot_wider(names_from = .metric, values_from = .estimate) |>
+    dplyr::mutate(model = name, .before = 1)
+}) |>
+  dplyr::arrange(model, id)
+print(clf_fold_metrics)
+
+cat("\n[Stage 2] Per-fold metrics for best regressors (positives only):\n")
+reg_names_tuned <- setdiff(names(tuned_reg), "lm_log")
+reg_fold_metrics <- purrr::imap_dfr(tuned_reg[reg_names_tuned], function(res, name) {
+  best_cfg <- dplyr::pull(select_best(res, metric = "rmse"), .config)
+  tune::collect_metrics(res, summarize = FALSE) |>
+    dplyr::filter(.config == best_cfg, .metric %in% c("rmse", "mae", "rsq")) |>
+    dplyr::select(id, .metric, .estimate) |>
+    tidyr::pivot_wider(names_from = .metric, values_from = .estimate) |>
+    dplyr::mutate(model = name, .before = 1)
+}) |>
+  dplyr::arrange(model, id)
+  
+print(reg_fold_metrics)
+```
+
+## Evaluate all pipelines on validation folds
+
+```{r}
+# Evaluate 16 pipelines on validation folds
+pipeline_results <- list()
+
+for (clf_name in names(finalized_clf)) {
+  for (reg_name in names(finalized_reg)) {
+    cat("[Pipelines] Evaluating:", clf_name, "+", reg_name, "\n")
+    # Fit on analysis portions and evaluate on assessment, per fold
+    fold_metrics <- map2_dfr(val_resamples$splits, pos_val_resamples$splits, function(split_all, split_pos) {
+      analysis_all <- analysis(split_all)
+      assess_all <- assessment(split_all)
+      analysis_pos <- analysis(split_pos)
+      assess_pos <- assessment(split_pos)
+
+      # Fit classifier on all weeks
+      clf_fit <- fit(finalized_clf[[clf_name]], data = analysis_all)
+      prob_yes <- predict(clf_fit, new_data = assess_all, type = "prob")$.pred_yes
+      prob_yes[is.na(prob_yes)] <- 0
+      prob_yes <- pmin(pmax(prob_yes, 0), 1)
+      occ_pred <- if_else(prob_yes >= 0.5, "yes", "no") |> factor(levels = c("no", "yes"))
+      # Compute classification metrics directly on vectors (more robust)
+      truth_occ <- factor(assess_all$y_occ, levels = c("no", "yes"))
+      pr_auc_val <- yardstick::pr_auc_vec(truth_occ, prob_yes, event_level = "second")
+      roc_auc_val <- yardstick::roc_auc_vec(truth_occ, prob_yes, event_level = "second")
+      f2_val <- yardstick::f_meas_vec(truth_occ, occ_pred, beta = 2)
+
+      # Fit regressor on positive weeks
+      reg_fit <- fit(finalized_reg[[reg_name]], data = analysis_pos)
+      sev_hat_assess_pos <- predict_severity(reg_fit, new_data = assess_pos, model_name = reg_name)
+      sev_fold <- reg_metrics(bind_cols(truth = assess_pos$strike_count, .pred = sev_hat_assess_pos),
+                              truth = truth, estimate = .pred)
+
+      # Combined expected counts on all assessment rows
+      # Need severity predictions for all rows; use positive-only model and multiply by prob
+      # For rows with zero true strikes, we still use expected count = p * E[Y|>0]
+      sev_hat_all <- predict_severity(reg_fit, new_data = assess_all, model_name = reg_name)
+      sev_hat_all <- pmax(pmin(sev_hat_all, quantile(sev_hat_all, 0.999, na.rm = TRUE)), 0)
+      sev_hat_all[!is.finite(sev_hat_all)] <- 0
+      combined_hat <- prob_yes * sev_hat_all
+      combined_fold <- reg_metrics(bind_cols(truth = assess_all$strike_count, .pred = combined_hat),
+                                   truth = truth, estimate = .pred)
+
+      tibble(
+        clf = clf_name,
+        reg = reg_name,
+        pr_auc = pr_auc_val,
+        roc_auc = roc_auc_val,
+        f2 = f2_val,
+        sev_mae = sev_fold$.estimate[sev_fold$.metric == "mae"],
+        sev_rmse = sev_fold$.estimate[sev_fold$.metric == "rmse"],
+        sev_r2 = sev_fold$.estimate[sev_fold$.metric == "rsq"],
+        comb_mae = combined_fold$.estimate[combined_fold$.metric == "mae"],
+        comb_rmse = combined_fold$.estimate[combined_fold$.metric == "rmse"],
+        comb_r2 = combined_fold$.estimate[combined_fold$.metric == "rsq"]
+      )
+    })
+
+    pipeline_results[[paste(clf_name, reg_name, sep = "_")]] <- fold_metrics
+    cat("[Pipelines] Completed:", clf_name, "+", reg_name, "\n")
+  }
+}
+
+val_summary <- bind_rows(pipeline_results, .id = "pipeline") |>
+  group_by(pipeline, clf, reg) |>
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") |>
+  arrange(comb_rmse)
+
+print(val_summary)
+
+# Tune decision thresholds for classifiers on validation folds (optimize F2)
+threshold_grid <- seq(0.05, 0.95, by = 0.05)
+
+compute_best_threshold <- function(wf) {
+  preds_tbl <- map_dfr(val_resamples$splits, function(split) {
+    analysis_all <- analysis(split)
+    assess_all <- assessment(split)
+    fit_obj <- fit(wf, data = analysis_all)
+    tibble(
+      truth = assess_all$y_occ,
+      prob = predict(fit_obj, new_data = assess_all, type = "prob")$.pred_yes
+    )
+  })
+
+  f_by_thr <- map_dfr(threshold_grid, function(th) {
+    pred <- if_else(preds_tbl$prob >= th, "yes", "no") |> factor(levels = c("no", "yes"))
+    tibble(threshold = th, f2 = yardstick::f_meas_vec(preds_tbl$truth, pred, beta = 2))
+  })
+
+  best_row <- f_by_thr[which.max(f_by_thr$f2), , drop = FALSE]
+  best_row$threshold
+}
+
+tuned_thresholds <- imap(finalized_clf, function(wf, name) {
+  cat("[Thresholds] Optimizing decision threshold for:", name, "\n")
+  thr <- compute_best_threshold(wf)
+  cat("[Thresholds] Best threshold for", name, "=", round(thr, 3), "\n")
+  thr
+})
+
+# Inspect tuned thresholds (optional)
+print(tuned_thresholds)
+```
+
+## Final fit and test evaluation (best pipeline by combined RMSE)
+
+```{r}
+#| label: final-test
+
+best_pipeline <- val_summary$pipeline[1]
+best_clf_name <- val_summary$clf[1]
+best_reg_name <- val_summary$reg[1]
+
+cat("Best pipeline:", best_pipeline, "=", best_clf_name, "+", best_reg_name, "\n")
+
+# Finalize on full pretest
+final_clf_fit <- fit(finalized_clf[[best_clf_name]], data = pretest_df)
+
+# Severity final fit on positives only (pretest)
+pretest_pos <- pretest_df |>
+  filter(strike_count > 0)
+final_reg_fit <- fit(finalized_reg[[best_reg_name]], data = pretest_pos)
+
+# Test predictions with tuned threshold for the selected classifier
+best_threshold <- tuned_thresholds[[best_clf_name]]
+test_prob_yes <- predict(final_clf_fit, new_data = test_df, type = "prob")$.pred_yes
+test_prob_yes[is.na(test_prob_yes)] <- 0
+test_prob_yes <- pmin(pmax(test_prob_yes, 0), 1)
+test_occ_pred <- if_else(test_prob_yes >= best_threshold, "yes", "no") |> factor(levels = c("no", "yes"))
+truth_occ <- factor(test_df$y_occ, levels = c("no","yes"))
+pr_auc_val <- yardstick::pr_auc_vec(truth_occ, test_prob_yes, event_level = "second")
+roc_auc_val <- yardstick::roc_auc_vec(truth_occ, test_prob_yes, event_level = "second")
+f2_val <- yardstick::f_meas_vec(truth_occ, test_occ_pred, beta = 2)
+test_occ <- tibble::tibble(
+  .metric = c("pr_auc", "roc_auc", "f_meas2"),
+  .estimator = "binary",
+  .estimate = c(pr_auc_val, roc_auc_val, f2_val)
+)
+
+test_sev_hat <- predict_severity(final_reg_fit, new_data = test_df, model_name = best_reg_name)
+test_sev_hat <- pmax(pmin(test_sev_hat, quantile(test_sev_hat, 0.999, na.rm = TRUE)), 0)
+test_sev_hat[!is.finite(test_sev_hat)] <- 0
+test_sev <- metric_set(mae, rmse, rsq)(
+  bind_cols(truth = test_df$strike_count[test_df$strike_count > 0],
+            .pred = test_sev_hat[test_df$strike_count > 0]),
+  truth = truth, estimate = .pred
+)
+
+test_combined_hat <- test_prob_yes * test_sev_hat
+test_combined <- metric_set(mae, rmse, rsq)(
+  bind_cols(truth = test_df$strike_count, .pred = test_combined_hat),
+  truth = truth, estimate = .pred
+)
+
+cat("\nTest occurrence metrics:\n"); print(test_occ)
+cat("\nTest severity metrics (on positives):\n"); print(test_sev)
+cat("\nTest combined metrics (all weeks):\n"); print(test_combined)
+
+# Naive baselines for reference
+naive_zero <- tibble(.metric = c("mae","rmse","rsq"), .estimator = "standard",
+                     .estimate = c(mae_vec(test_df$strike_count, rep(0, nrow(test_df))),
+                                   rmse_vec(test_df$strike_count, rep(0, nrow(test_df))),
+                                   rsq_vec(test_df$strike_count, rep(0, nrow(test_df)))))
+
+combined_counts <- c(pretest_df$strike_count, test_df$strike_count)
+lagged_all <- dplyr::lag(combined_counts, 1)
+lag1_preds <- tail(lagged_all, nrow(test_df))
+lag1_preds[is.na(lag1_preds)] <- 0
+naive_lag1 <- tibble(.metric = c("mae","rmse","rsq"), .estimator = "standard",
+                     .estimate = c(mae_vec(test_df$strike_count, lag1_preds),
+                                   rmse_vec(test_df$strike_count, lag1_preds),
+                                   rsq_vec(test_df$strike_count, lag1_preds)))
+
+roll4 <- zoo::rollapplyr(c(pretest_df$strike_count, test_df$strike_count), 4, mean, partial = TRUE)
+roll4_test <- tail(roll4, nrow(test_df))
+naive_roll4 <- tibble(.metric = c("mae","rmse","rsq"), .estimator = "standard",
+                      .estimate = c(mae_vec(test_df$strike_count, roll4_test),
+                                    rmse_vec(test_df$strike_count, roll4_test),
+                                    rsq_vec(test_df$strike_count, roll4_test)))
+
+cat("\nNaive baselines (all weeks):\n")
+print(list(zero = naive_zero, lag1 = naive_lag1, roll4 = naive_roll4))
+```
+
+## Save outputs
+
+```{r}
+#| label: save-outputs
+
+dir.create("model_outputs", showWarnings = FALSE)
+
+# 1) Validation summaries and per-fold metrics
+readr::write_csv(val_summary, "model_outputs/two_stage_val_summary.csv")
+
+val_folds_tbl <- bind_rows(pipeline_results, .id = "pipeline")
+readr::write_csv(val_folds_tbl, "model_outputs/two_stage_val_folds.csv")
+
+# 2) Final model objects
+saveRDS(final_clf_fit, "model_outputs/two_stage_final_classifier.rds")
+saveRDS(final_reg_fit, "model_outputs/two_stage_final_regressor.rds")
+
+# 3) Test predictions and metrics
+test_predictions_tbl <- test_df |>
+  select(date, action_geo_adm1_code, action_geo_country_code, strike_count, y_occ) |>
+  mutate(prob_yes = test_prob_yes,
+         sev_hat = test_sev_hat,
+         expected_count = prob_yes * sev_hat)
+
+arrow::write_parquet(test_predictions_tbl, "model_outputs/two_stage_test_predictions.parquet")
+
+test_metrics_tbl <- bind_rows(
+  test_occ |> mutate(stage = "occurrence"),
+  test_sev |> mutate(stage = "severity_positive"),
+  test_combined |> mutate(stage = "combined_all")
+)
+readr::write_csv(test_metrics_tbl, "model_outputs/two_stage_test_metrics.csv")
+
+# 4) Best pipeline record
+best_info <- tibble(
+  best_pipeline = best_pipeline,
+  classifier = best_clf_name,
+  regressor = best_reg_name
+)
+readr::write_csv(best_info, "model_outputs/two_stage_best_pipeline.csv")
+
+# 5) Save tuned threshold
+thr_tbl <- tibble(classifier = best_clf_name, tuned_threshold = best_threshold)
+readr::write_csv(thr_tbl, "model_outputs/two_stage_tuned_threshold.csv")
+
+# 6) Save naive baselines
+naive_tbl <- tibble(
+  baseline = c("zero","lag1","roll4"),
+  mae = c(naive_zero$.estimate[1], naive_lag1$.estimate[1], naive_roll4$.estimate[1]),
+  rmse = c(naive_zero$.estimate[2], naive_lag1$.estimate[2], naive_roll4$.estimate[2]),
+  rsq = c(naive_zero$.estimate[3], naive_lag1$.estimate[3], naive_roll4$.estimate[3])
+)
+readr::write_csv(naive_tbl, "model_outputs/two_stage_naive_baselines.csv")
+
+# 7) Save compact RDS summary of validation and final test results
+results_rds <- list(
+  val_summary = val_summary,
+  best_info = best_info,
+  tuned_thresholds = tuned_thresholds,
+  test_metrics = list(
+    occurrence = test_occ,
+    severity_positive = test_sev,
+    combined_all = test_combined
+  )
+)
+saveRDS(results_rds, "model_outputs/two_stage_results_summary.rds")
+```
+
+## Feature importance for final models
+
+```{r}
+#| label: feature-importance
+
+# Try model-based importance first; fall back silently if unsupported
+clf_engine <- try(workflows::extract_fit_parsnip(final_clf_fit)$fit, silent = TRUE)
+reg_engine <- try(workflows::extract_fit_parsnip(final_reg_fit)$fit, silent = TRUE)
+
+clf_vip_plot <- try(vip::vip(clf_engine, num_features = 20), silent = TRUE)
+reg_vip_plot <- try(vip::vip(reg_engine, num_features = 20), silent = TRUE)
+
+if (!inherits(clf_vip_plot, "try-error")) {
+  ggsave("model_outputs/two_stage_feature_importance_classifier.png", clf_vip_plot, width = 9, height = 6, dpi = 300)
+}
+if (!inherits(reg_vip_plot, "try-error")) {
+  ggsave("model_outputs/two_stage_feature_importance_regressor.png", reg_vip_plot, width = 9, height = 6, dpi = 300)
+}
+```
+
+## Appendix: single-stage severity models (reference)
+
+```{r}
+#| label: appendix-single-stage
+
+# Train on pretest (all weeks), evaluate on test
+
+tree_recipe <- recipe(strike_count ~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.01) |>
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+
+single_specs <- list(
+  lm_log = linear_reg() |> set_engine("lm") |> set_mode("regression"),
+  xgb_poi = xgb_poi_spec,
+  lgb_poi = lgb_poi_spec,
+  lgb_twd = lgb_twd_spec
+)
+
+single_wfs <- list(
+  lm_log = workflow() |> add_recipe(tree_recipe |> step_mutate(log_count = log1p(strike_count)) |> step_rm(strike_count)) |> add_model(single_specs$lm_log),
+  xgb_poi = workflow() |> add_recipe(tree_recipe) |> add_model(single_specs$xgb_poi),
+  lgb_poi = workflow() |> add_recipe(tree_recipe) |> add_model(single_specs$lgb_poi),
+  lgb_twd = workflow() |> add_recipe(tree_recipe) |> add_model(single_specs$lgb_twd)
+)
+
+single_fit_predict <- function(wf, name) {
+  fit_obj <- fit(wf, data = pretest_df)
+  preds <- predict(fit_obj, new_data = test_df)$.pred
+  # Back-transform for lm_log: recipe models log1p(strike_count) as outcome
+  # so we invert with expm1() to return to the original count scale.
+  if (name == "lm_log") preds <- pmax(expm1(preds), 0)
+  tibble(model = name, mae = mae_vec(test_df$strike_count, preds), rmse = rmse_vec(test_df$strike_count, preds), r2 = rsq_vec(test_df$strike_count, preds))
+}
+
+single_results <- imap_dfr(single_wfs, single_fit_predict)
+print(single_results)
+
+# Save appendix results
+readr::write_csv(single_results, "model_outputs/single_stage_results.csv")
+```
+
+

@@ -1,0 +1,308 @@
+---
+title: "Build ADM1-Week Analysis Datasets"
+format: html
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(janitor)
+library(stringr)
+library(zoo)
+library(sf)
+library(purrr)
+library(geodist)
+library(FNN)
+
+conflicted::conflicts_prefer(dplyr::lag)
+conflicted::conflicts_prefer(dplyr::filter)
+```
+
+## Load events and select fields
+
+```{r}
+#| label: load-events
+
+events <- read_parquet("data/enhanced/gdelt_strikes.parquet") |>
+  clean_names() |>
+  select(
+    # identifiers and dates
+    globaleventid, sqldate,
+    # location fields
+    action_geo_country_code,
+    action_geo_adm1_code = action_geo_adm1code,
+    action_geo_adm2_code = action_geo_adm2code,
+    action_geo_lat, action_geo_long,
+    # counts and tone
+    num_mentions, num_articles, avg_tone,
+    # actor types
+    actor1_type1_code = actor1type1code,
+    actor2_type1_code = actor2type1code
+  )
+
+glimpse(events)
+```
+
+## Aggregate to ADM1 × week and expand full panel
+
+```{r}
+#| label: aggregate-expand
+
+weekly_strikes <- events |>
+  filter(
+    !is.na(action_geo_adm1_code),
+    !is.na(action_geo_country_code),
+    action_geo_adm1_code != action_geo_country_code
+  ) |>
+  mutate(
+    date = as.Date(sqldate, format = "%Y%m%d"),
+    week_date = floor_date(date, "week"),
+    num_mentions = as.numeric(num_mentions),
+    num_articles = as.numeric(num_articles)
+  ) |>
+  group_by(action_geo_adm1_code, week_date) |>
+  summarise(
+    action_geo_country_code = first(action_geo_country_code),
+    strike_count = n(),
+    avg_tone = mean(avg_tone, na.rm = TRUE),
+    total_mentions = sum(num_mentions, na.rm = TRUE),
+    total_articles = sum(num_articles, na.rm = TRUE),
+    actor_diversity = n_distinct(paste(actor1_type1_code, actor2_type1_code), na.rm = TRUE),
+    unique_actor1_types = n_distinct(actor1_type1_code, na.rm = TRUE),
+    unique_actor2_types = n_distinct(actor2_type1_code, na.rm = TRUE),
+    has_gov = any(str_detect(paste(actor1_type1_code, actor2_type1_code), "GOV"), na.rm = TRUE),
+    has_labor = any(str_detect(paste(actor1_type1_code, actor2_type1_code), "LAB"), na.rm = TRUE),
+    has_civil = any(str_detect(paste(actor1_type1_code, actor2_type1_code), "CVL"), na.rm = TRUE),
+    prop_gov = mean(str_detect(paste(actor1_type1_code, actor2_type1_code), "GOV"), na.rm = TRUE),
+    prop_labor = mean(str_detect(paste(actor1_type1_code, actor2_type1_code), "LAB"), na.rm = TRUE),
+    prop_civil = mean(str_detect(paste(actor1_type1_code, actor2_type1_code), "CVL"), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    date = week_date,
+    year = year(week_date),
+    week = isoweek(week_date)
+  ) |>
+  arrange(action_geo_adm1_code, date)
+
+panel_dates <- tibble(date = seq(min(weekly_strikes$date), max(weekly_strikes$date), by = "week"))
+adm1_keys <- weekly_strikes |>
+  distinct(action_geo_adm1_code, action_geo_country_code)
+
+weekly_strikes <- adm1_keys |>
+  tidyr::crossing(panel_dates) |>
+  left_join(weekly_strikes, by = c("action_geo_adm1_code", "action_geo_country_code", "date")) |>
+  mutate(
+    strike_count = coalesce(strike_count, 0L),
+    avg_tone = coalesce(avg_tone, 0),
+    total_mentions = coalesce(total_mentions, 0),
+    total_articles = coalesce(total_articles, 0),
+    actor_diversity = coalesce(actor_diversity, 0),
+    unique_actor1_types = coalesce(unique_actor1_types, 0),
+    unique_actor2_types = coalesce(unique_actor2_types, 0),
+    has_gov = coalesce(has_gov, FALSE),
+    has_labor = coalesce(has_labor, FALSE),
+    has_civil = coalesce(has_civil, FALSE),
+    prop_gov = coalesce(prop_gov, 0),
+    prop_labor = coalesce(prop_labor, 0),
+    prop_civil = coalesce(prop_civil, 0)
+  ) |>
+  group_by(action_geo_adm1_code) |>
+  tidyr::fill(action_geo_country_code, .direction = "downup") |>
+  ungroup() |>
+  arrange(action_geo_adm1_code, date)
+```
+
+## Temporal features (lags/rolling/seasonality)
+
+```{r}
+#| label: temporal-features
+
+weekly_strikes <- weekly_strikes |>
+  group_by(action_geo_adm1_code) |>
+  mutate(
+    strike_count_lag1 = lag(strike_count, 1),
+    strike_count_lag2 = lag(strike_count, 2),
+    strike_count_lag4 = lag(strike_count, 4),
+    rolling_avg_4wk = lag(rollmean(strike_count, k = 4, fill = NA, align = "right"), 1),
+    rolling_avg_8wk = lag(rollmean(strike_count, k = 8, fill = NA, align = "right"), 1),
+    avg_tone_lag1 = lag(avg_tone, 1),
+    avg_tone_lag2 = lag(avg_tone, 2),
+    total_mentions_lag1 = lag(total_mentions, 1),
+    total_mentions_lag2 = lag(total_mentions, 2),
+    total_articles_lag1 = lag(total_articles, 1),
+    total_articles_lag2 = lag(total_articles, 2),
+    actor_diversity_lag1 = lag(actor_diversity, 1),
+    unique_actor1_types_lag1 = lag(unique_actor1_types, 1),
+    unique_actor2_types_lag1 = lag(unique_actor2_types, 1),
+    prop_gov_lag1 = lag(prop_gov, 1),
+    prop_labor_lag1 = lag(prop_labor, 1),
+    prop_civil_lag1 = lag(prop_civil, 1),
+    time_trend = row_number(),
+    year_sin = sin(2 * pi * year(date) / 10),
+    year_cos = cos(2 * pi * year(date) / 10)
+  ) |>
+  ungroup() |>
+  mutate(
+    month = month(date),
+    quarter = quarter(date),
+    is_year_end = month %in% c(11, 12, 1)
+  ) |>
+  mutate(
+    has_min_history_2 = !is.na(strike_count_lag2)
+  ) |>
+  mutate(
+    across(c(
+      strike_count_lag1, strike_count_lag2, strike_count_lag4,
+      rolling_avg_4wk, rolling_avg_8wk,
+      total_articles_lag1, total_articles_lag2,
+      total_mentions_lag1, total_mentions_lag2,
+      avg_tone_lag1, avg_tone_lag2,
+      actor_diversity_lag1,
+      unique_actor1_types_lag1, unique_actor2_types_lag1,
+      prop_gov_lag1, prop_labor_lag1, prop_civil_lag1
+    ), ~coalesce(., 0))
+  )
+```
+
+## Spatial lag features
+
+```{r}
+#| label: spatial-lags
+
+# Representative point per ADM1
+adm1_points <- events |>
+  filter(!is.na(action_geo_adm1_code), !is.na(action_geo_country_code),
+         !is.na(action_geo_lat), !is.na(action_geo_long)) |>
+  group_by(action_geo_adm1_code, action_geo_country_code) |>
+  summarise(lat = median(action_geo_lat, na.rm = TRUE),
+            lon = median(action_geo_long, na.rm = TRUE),
+            .groups = "drop") |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# kNN neighbor edges (same-country)
+k <- 6
+coords <- st_coordinates(adm1_points)
+knn_idx <- FNN::get.knn(coords, k = k)$nn.index
+
+geo_cc <- adm1_points |>
+  st_drop_geometry() |>
+  select(action_geo_adm1_code, action_geo_country_code)
+
+edges <- purrr::map2_dfr(seq_len(nrow(adm1_points)), asplit(knn_idx, 1), function(i, nbrs) {
+  tibble(gid = adm1_points$action_geo_adm1_code[i],
+         gid_n = adm1_points$action_geo_adm1_code[nbrs])
+}) |>
+  left_join(geo_cc, by = c("gid" = "action_geo_adm1_code")) |>
+  left_join(geo_cc, by = c("gid_n" = "action_geo_adm1_code"), suffix = c("", "_n")) |>
+  filter(action_geo_country_code == action_geo_country_code_n) |>
+  select(gid, gid_n)
+
+# Country-level lag t-1
+country_lag <- weekly_strikes |>
+  group_by(action_geo_country_code, date) |>
+  summarise(country_strikes = sum(strike_count), .groups = "drop") |>
+  arrange(action_geo_country_code, date) |>
+  group_by(action_geo_country_code) |>
+  mutate(country_strikes_lag1 = dplyr::lag(country_strikes, 1)) |>
+  ungroup() |>
+  select(action_geo_country_code, date, country_strikes_lag1)
+
+# Neighbor lag t-1 (sum of neighbors' t-1)
+lagged_t1 <- weekly_strikes |>
+  group_by(action_geo_adm1_code) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(strike_t1 = dplyr::lag(strike_count, 1)) |>
+  ungroup() |>
+  select(action_geo_adm1_code, date, strike_t1)
+
+contig_lag <- lagged_t1 |>
+  rename(gid_n = action_geo_adm1_code) |>
+  inner_join(distinct(edges), by = "gid_n", relationship = "many-to-many") |>
+  group_by(gid, date) |>
+  summarise(contig_strikes_t1 = sum(strike_t1, na.rm = TRUE), .groups = "drop") |>
+  rename(action_geo_adm1_code = gid)
+
+# Distance-weighted lag t-1 (inverse distance within cutoff)
+pts_df <- adm1_points |>
+  mutate(lon = st_coordinates(geometry)[,1],
+         lat = st_coordinates(geometry)[,2]) |>
+  st_drop_geometry()
+
+D <- geodist(pts_df[,c("lon","lat")], measure = "geodesic") / 1000
+cutoff_km <- 500
+W <- 1/(D + 1)
+W[D > cutoff_km] <- 0
+diag(W) <- 0
+W <- W / pmax(rowSums(W), 1)
+
+W_long <- as_tibble(which(W > 0, arr.ind = TRUE)) |>
+  transmute(gid = pts_df$action_geo_adm1_code[row],
+            gid_n = pts_df$action_geo_adm1_code[col],
+            w = W[cbind(row, col)])
+
+distw_lag <- lagged_t1 |>
+  rename(gid_n = action_geo_adm1_code) |>
+  inner_join(distinct(W_long), by = "gid_n", relationship = "many-to-many") |>
+  group_by(gid, date) |>
+  summarise(distw_strikes_t1 = sum(w * strike_t1, na.rm = TRUE), .groups = "drop") |>
+  rename(action_geo_adm1_code = gid)
+
+weekly_strikes <- weekly_strikes |>
+  left_join(country_lag, by = c("action_geo_country_code", "date")) |>
+  left_join(contig_lag, by = c("action_geo_adm1_code", "date")) |>
+  left_join(distw_lag, by = c("action_geo_adm1_code", "date")) |>
+  mutate(
+    country_strikes_lag1 = coalesce(country_strikes_lag1, 0),
+    contig_strikes_t1 = coalesce(contig_strikes_t1, 0),
+    distw_strikes_t1 = coalesce(distw_strikes_t1, 0)
+  )
+```
+
+## Save datasets
+
+```{r}
+#| label: save-datasets
+
+dir.create("data/analysis", recursive = TRUE, showWarnings = FALSE)
+
+adm_week_full <- weekly_strikes |>
+  select(
+    strike_count,
+    action_geo_adm1_code, action_geo_country_code,
+    date, year, week,
+    time_trend, year_sin, year_cos, month, quarter, is_year_end,
+    strike_count_lag1, strike_count_lag2, strike_count_lag4,
+    rolling_avg_4wk, rolling_avg_8wk,
+    total_articles_lag1, total_articles_lag2,
+    total_mentions_lag1, total_mentions_lag2,
+    avg_tone_lag1, avg_tone_lag2,
+    actor_diversity_lag1,
+    unique_actor1_types_lag1, unique_actor2_types_lag1,
+    prop_gov_lag1, prop_labor_lag1, prop_civil_lag1,
+    country_strikes_lag1, contig_strikes_t1, distw_strikes_t1,
+    # contemporaneous aggregates (for potential analysis use)
+    avg_tone, total_mentions, total_articles,
+    actor_diversity, unique_actor1_types, unique_actor2_types,
+    has_gov, has_labor, has_civil, prop_gov, prop_labor, prop_civil,
+    has_min_history_2
+  )
+
+write_parquet(adm_week_full, "data/analysis/adm_week_full.parquet")
+
+adm_week_positive <- adm_week_full |>
+  filter(strike_count > 0)
+
+write_parquet(adm_week_positive, "data/analysis/adm_week_positive.parquet")
+
+cat("Saved: data/analysis/adm_week_full.parquet (", nrow(adm_week_full), " rows)\n", sep = "")
+cat("Saved: data/analysis/adm_week_positive.parquet (", nrow(adm_week_positive), " rows)\n", sep = "")
+```
+
+

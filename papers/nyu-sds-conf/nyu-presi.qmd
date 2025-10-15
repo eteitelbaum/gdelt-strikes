@@ -1,0 +1,1512 @@
+---
+title: "Forecasting Strikes with GDELT Event Data"
+subtitle: "A Preliminary Analysis"
+author: "Emmanuel Teitelbaum"
+date: today
+date-format: long
+footer: "[View Our Code and Data](https://github.com/eteitelbaum/code-satp)"
+logo: images/esia-logo.png
+format:
+  revealjs:
+    theme: [simple, custom.scss]
+    transition: fade
+    slide-number: true
+    chalkboard: true
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r}
+#| label: setup
+#| echo: false
+#| message: false
+#| warning: false
+
+# Packages
+library(arrow)
+library(dplyr)
+library(stringr)
+library(janitor)
+library(lubridate)
+library(readr)
+library(ggplot2)
+library(kableExtra)
+library(broom)
+
+# Set seed for reproducible sampling
+set.seed(74)
+
+# Root-aware paths via here(); avoids ../ from subfolders
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+root <- here::here()
+paths <- list(
+  raw              = file.path(root, "data/raw/gdelt_strikes.parquet"),
+  filtered         = file.path(root, "data/raw/gdelt_strikes_filtered.parquet"),
+  adm_week_full    = file.path(root, "data/analysis/adm_week_full.parquet"),
+  hiconf           = file.path(root, "data/raw/gdelt_strikes_hiconf.parquet"),
+  gkg_event_level  = file.path(root, "data/raw/strike_event_gkg.parquet"),
+  enriched         = file.path(root, "data/enhanced/gdelt_strikes_enriched.parquet"),
+  final_strikes    = file.path(root, "data/enhanced/gdelt_strikes.parquet")
+)
+
+# Source helpers kept in repo
+helpers_path <- file.path(root, "papers/nyu-sds-conf/helpers/presi_helpers.R")
+if (file.exists(helpers_path)) source(helpers_path)
+
+# Preload only datasets needed for illustrative URL samples
+adm1_only  <- arrow::read_parquet(paths$filtered)
+hiconf     <- arrow::read_parquet(paths$hiconf)  
+seg        <- arrow::read_parquet(paths$gkg_event_level)
+final      <- arrow::read_parquet(paths$final_strikes)
+```
+
+# Part 1: Mining GDELT 
+
+## What is GDELT? 
+
+<br>
+
+- Global news event database coded with the CAMEO taxonomy.
+- Strikes fall under Protest (EventRootCode 14); EventCode 143 covers Strike/Boycott.
+- Subtypes commonly used include: 1431 Work Stoppage, 1432 General Strike, 1433 Boycott.
+- In this project we targeted EventCode 143 and its subcategories.
+
+## Google BigQuery (public datasets)
+
+<br>
+
+- Serverless data warehouse; SQL at scale with on-demand pricing.
+- GDELT is hosted as public datasets under `gdelt-bq.gdeltv2`.
+- We query public tables and materialize intermediate results in our project for reuse.
+
+## GDELT tables used in this study
+
+<br>
+
+- `events`: event-level records (geography, date, actors, intensity, tone, source URL).
+- `eventmentions`: article mentions of events (Confidence, source type, tone).
+- `gkg`: Global Knowledge Graph (per-document themes, tone, people, source URLs).
+
+## Pipeline overview
+
+<div style="text-align: center;">
+```{mermaid}
+graph TD
+    A[Raw events] --> B[ADM1 filter]
+    B --> C[High-confidence filter]
+    C --> D[GKG enrichment]
+    D --> E[STRIKE theme filter]
+    E --> F[Final dataset]
+```
+</div>
+
+## Step 1: Raw events extraction
+
+<br> 
+
+Downloaded strike events with latitude and longitude info. Yields table with **492,500 rows**. 
+
+```sql
+SELECT *
+FROM `gdelt-bq.gdeltv2.events`
+WHERE EventCode LIKE '143%'
+  AND SQLDATE >= 20150101
+  AND ActionGeo_Lat IS NOT NULL
+  AND ActionGeo_Long IS NOT NULL;
+```
+
+## Step 2: ADM1 geographic filter
+
+<br>
+
+Filtered for events with valid ADM1 codes. Yields table with **328,982 rows**.
+
+```{r}
+#| label: adm1-filter-save
+#| echo: true
+#| eval: false
+
+adm1_only <- raw |>
+  dplyr::filter(
+    !is.na(ActionGeo_ADM1Code),
+    !is.na(ActionGeo_CountryCode),
+    ActionGeo_ADM1Code != ActionGeo_CountryCode
+  )
+
+arrow::write_parquet(
+  adm1_only,
+  file.path(root, "data/raw/gdelt_strikes_filtered.parquet")
+)
+```
+
+## Step 3: High-confidence filter
+
+Queried the `eventmentions` table to find events with high-confidence mentions (Confidence ≥80). Leaves us with **134,141 events.**
+
+```sql
+WITH high_conf AS (
+  SELECT m.GLOBALEVENTID,
+         COUNTIF(m.Confidence >= 80) AS high_conf_mentions,
+         COUNT(DISTINCT m.MentionSourceName) AS unique_sources
+  FROM `gdelt-bq.gdeltv2.eventmentions` m
+  JOIN `gdelt-449818.gdelt_analysis.strike_events` s
+    ON m.GLOBALEVENTID = s.GLOBALEVENTID
+  GROUP BY m.GLOBALEVENTID
+)
+SELECT s.GLOBALEVENTID, h.high_conf_mentions, h.unique_sources
+FROM `gdelt-449818.gdelt_analysis.strike_events` s
+JOIN high_conf h ON s.GLOBALEVENTID = h.GLOBALEVENTID
+WHERE h.high_conf_mentions > 0;
+```
+
+## Step 4: GKG enrichment pipeline
+
+<br>
+
+- This was a multi-step process to enrich strike events with tone metrics and themes from news articles.
+- Goal was to link tone, themes and URLs from the GDELT Knowledge Graph (GKG) to the strikes in the events table
+- To do that we first had to filter the documents related to each strike from the `eventmentions` table
+
+## Step 4.1: Extract mention identifiers
+
+<br>
+Select only eventmentions that refer to high-confidence strike events.
+
+```sql
+CREATE OR REPLACE TABLE `gdelt-449818.gdelt_analysis.strike_mentions` AS
+SELECT DISTINCT m.MentionIdentifier, m.GLOBALEVENTID
+FROM `gdelt-bq.gdeltv2.eventmentions` m
+JOIN `gdelt-449818.gdelt_analysis.strike_events_hiconf` s
+  ON m.GLOBALEVENTID = s.GLOBALEVENTID;
+```
+
+## Step 4.2: Filter GKG documents
+
+<br>
+Materialize only GKG documents that mention strike events. **Expensive scan (~20TB, ~$128): Do once.**
+
+```sql
+CREATE OR REPLACE TABLE `gdelt-449818.gdelt_analysis.strike_gkg_docs` AS
+SELECT g.*
+FROM `gdelt-bq.gdeltv2.gkg` g
+JOIN `gdelt-449818.gdelt_analysis.strike_mentions` sm
+  ON g.DocumentIdentifier = sm.MentionIdentifier
+WHERE g.DATE >= 20150101;
+```
+
+## Step 4.3: Aggregate tone and URLs
+
+<br>
+Aggregate document-level tone to event level and collect article URLs.
+
+```sql
+CREATE OR REPLACE TABLE gdelt-449818.gdelt_analysis.strike_event_tone AS
+SELECT m.GLOBALEVENTID,
+       AVG(CAST(SPLIT(g.V2Tone, ',')[OFFSET(0)] AS FLOAT64)) AS avg_tone,
+       ARRAY_AGG(DISTINCT g.DocumentIdentifier IGNORE NULLS) AS article_urls
+FROM `gdelt-449818.gdelt_analysis.strike_mentions` m
+JOIN `gdelt-449818.gdelt_analysis.strike_gkg_docs` g
+  ON m.MentionIdentifier = g.DocumentIdentifier
+GROUP BY m.GLOBALEVENTID;
+```
+
+## Step 4.4: Aggregate themes
+
+<br>
+Tokenize GKG V2Themes and aggregate unique themes per event.
+
+```sql
+-- Event-level themes (tokenize + aggregate)
+CREATE OR REPLACE TABLE gdelt-449818.gdelt_analysis.strike_event_themes AS
+SELECT m.GLOBALEVENTID,
+       STRING_AGG(DISTINCT TRIM(theme), ';') AS all_themes
+FROM `gdelt-449818.gdelt_analysis.strike_mentions` m
+JOIN `gdelt-449818.gdelt_analysis.strike_gkg_docs` g
+  ON m.MentionIdentifier = g.DocumentIdentifier
+CROSS JOIN UNNEST(SPLIT(g.V2Themes, ';')) AS theme
+GROUP BY m.GLOBALEVENTID;
+```
+
+## Step 4.5: Combine GKG enrichments
+
+<br>
+Combine tone and themes into single reusable event-level table.
+
+```sql
+-- Final event-level enrichment table
+CREATE OR REPLACE TABLE gdelt-449818.gdelt_analysis.strike_event_gkg AS
+SELECT t.*, th.all_themes
+FROM gdelt-449818.gdelt_analysis.strike_event_tone t
+LEFT JOIN gdelt-449818.gdelt_analysis.strike_event_themes th
+  ON t.GLOBALEVENTID = th.GLOBALEVENTID;
+```
+
+## What GKG enrichments are used for
+
+**Tone metrics** → Used as predictors in strike forecasting models, measure overall sentiment of news coverage (scale: -100 to +100, but typically ranges -10 to +10)
+
+**Mention/Article counts** → Captures media attention and event significance, e.g. total event mentions, total articles related to event
+
+**Themes** → Used to filter events to strike-relevant content (STRIKE theme filter)
+
+## Theme exploration
+
+| Example themes found in our events (before filtering):
+- STRIKE (direct match)
+- PROTEST (related activity)
+- TAX_FNCACT_WORKERS, TAX_FNCACT_EMPLOYEE (labor-related)
+- ECON_UNIONS (union activity)
+- WB_2811_COLLECTIVE_BARGAINING (negotiation context)
+
+## Why we chose "STRIKE" theme only
+
+- We filtered for events where themes contain "STRIKE" because:
+  - Most specific indicator of strike events
+  - Balances precision (true strikes) vs. recall (catching most strikes)
+  - Other themes too broad (PROTEST) or too narrow (specific union codes)
+- Left us with **30,899 strike events**.
+
+## Data quality validation
+
+```{r}
+#| label: validation-plot
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+
+# Load coded results
+url_coded <- read_csv("url_validation_coded.csv")
+
+# Calculate precision by stage
+validation_summary <- url_coded |>
+  group_by(stage) |>
+  summarise(
+    n_urls = n(),
+    n_relevant = sum(is_relevant),
+    precision = round(mean(is_relevant) * 100, 1)
+  ) |>
+  mutate(
+    stage_label = case_when(
+      stage == "1_ADM1" ~ "ADM1 filter",
+      stage == "2_HighConf" ~ "+ High-confidence",
+      stage == "3_STRIKE" ~ "+ STRIKE theme"
+    ),
+    stage_order = case_when(
+      stage == "1_ADM1" ~ 1,
+      stage == "2_HighConf" ~ 2,
+      stage == "3_STRIKE" ~ 3
+    )
+  ) |>
+  arrange(stage_order)
+
+# Create bar chart
+ggplot(validation_summary, aes(x = reorder(stage_label, stage_order), y = precision)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = paste0(precision, "%")), vjust = -0.5, size = 4) +
+  labs(
+    title = "Filtering Effectiveness",
+    subtitle = "Percentage of URLs actually about strikes at each filtering stage",
+    x = "Filter Stage",
+    y = "Precision (% Strike-Relevant URLs)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank()
+  ) +
+  ylim(0, max(validation_summary$precision) * 1.1)
+```
+
+## Examples: Definite strikes {.smaller}
+
+```{r}
+#| label: definite-strikes
+#| echo: false
+#| message: false
+#| warning: false
+
+# Load coded results and get definite strikes
+url_coded <- read_csv("url_validation_coded.csv")
+
+strikes <- url_coded |> 
+  filter(is_relevant == 1) |> 
+  slice(2:5) |>  # Skip Portugal trains, get more obvious strikes
+  select(url, notes)
+
+# Display as simple table
+knitr::kable(strikes, 
+             col.names = c("URL", "Description"),
+             format = "html") |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+## Examples: Definite non-strikes {.smaller}
+
+```{r}
+#| label: definite-non-strikes
+#| echo: false
+#| message: false
+#| warning: false
+
+# Get definite non-strikes
+non_strikes <- url_coded |> 
+  filter(is_relevant == 0) |> 
+  head(4) |>
+  select(url, notes)
+
+# Display as simple table
+knitr::kable(non_strikes, 
+             col.names = c("URL", "Description"),
+             format = "html") |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+## Examples: Borderline cases {.smaller}
+
+```{r}
+#| label: borderline-cases
+#| echo: false
+#| message: false
+#| warning: false
+
+# Get some borderline cases (mix of relevant/not relevant)
+# Include Portugal train example (less obvious strike) + two from STRIKE stage
+portugal_train <- url_coded |> 
+  filter(is_relevant == 1) |> 
+  slice(1) |>
+  select(url, notes)
+
+strike_stage_examples <- url_coded |> 
+  filter(stage == "3_STRIKE") |>  # After STRIKE filter
+  arrange(desc(is_relevant)) |>   # Put relevant first
+  slice(1:2) |>  # Get first two examples
+  select(url, notes)
+
+borderline <- bind_rows(strike_stage_examples, portugal_train) |>
+  mutate(
+    # Break up the long Mexican URL for better readability
+    url = case_when(
+      str_detect(url, "noticias.terra.es") ~ 
+        "https://noticias.terra.es/mundo/latinoamerica/\nmaestros-marchan-en-la-ciudad-de-mexico\n-en-contra-de-la-reforma-educativa",
+      TRUE ~ url
+    )
+  )
+
+# Display as simple table
+knitr::kable(borderline, 
+             col.names = c("URL", "Description"),
+             format = "html") |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+# Part 2: Data Exploration
+
+```{r}
+#| label: part2-setup
+
+# Load the panel dataset for analysis
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(viridis)
+
+# Load adm_week_full data
+adm_week_full <- arrow::read_parquet(file.path(root, "data/analysis/adm_week_full.parquet"))
+
+# Basic dataset info
+# cat("Panel dataset dimensions:", nrow(adm_week_full), "region-weeks\n")
+# cat("Unique ADM1 regions:", n_distinct(adm_week_full$action_geo_adm1_code), "\n")
+# cat("Date range:", min(adm_week_full$date), "to", max(adm_week_full$date), "\n")
+# cat("Total weeks:", n_distinct(adm_week_full$date), "\n")
+```
+
+## From events to panel data
+
+- **30,899 strike events** → **806,000 region-weeks** 
+- **1,550 ADM1 regions** × **560 weeks** = full panel
+- **Target**: Weekly strike counts per region
+- **Challenge**: Most region-weeks have zero strikes
+
+```{r}
+#| label: panel-structure
+
+# Calculate panel structure summary
+panel_summary <- adm_week_full |>
+  summarise(
+    total_observations = n(),
+    unique_regions = n_distinct(action_geo_adm1_code),
+    unique_countries = n_distinct(action_geo_country_code),
+    total_weeks = n_distinct(date),
+    date_range = paste(min(date), "to", max(date))
+  )
+
+# Display as formatted text
+# cat("Panel Structure:\n")
+# cat("- Total observations:", format(panel_summary$total_observations, big.mark = ","), "region-weeks\n")
+# cat("- Unique ADM1 regions:", format(panel_summary$unique_regions, big.mark = ","), "\n")
+# cat("- Unique countries:", format(panel_summary$unique_countries, big.mark = ","), "\n")
+# cat("- Time span:", panel_summary$total_weeks, "weeks (", round(panel_summary$total_weeks/52, 1), "years)\n")
+# cat("- Date range:", panel_summary$date_range, "\n")
+```
+
+## The Zero-inflation problem
+
+```{r}
+#| label: zero-inflation-analysis
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+
+# Calculate zero-inflation and overdispersion statistics
+zero_stats <- adm_week_full |>
+  summarise(
+    # Zero inflation
+    zero_count = sum(strike_count == 0),
+    positive_count = sum(strike_count > 0),
+    zero_rate = mean(strike_count == 0),
+    positive_rate = mean(strike_count > 0),
+    
+    # Distribution moments
+    mean_count = mean(strike_count),
+    var_count = var(strike_count),
+    overdispersion_ratio = var_count / mean_count,
+    
+    # Quantiles
+    p50 = quantile(strike_count, 0.5),
+    p90 = quantile(strike_count, 0.9),
+    p95 = quantile(strike_count, 0.95),
+    p99 = quantile(strike_count, 0.99),
+    max_count = max(strike_count)
+  )
+
+# Create zero vs positive weeks bar chart
+zero_positive_data <- data.frame(
+  category = c("Zero Strikes", "Positive Strikes"),
+  count = c(zero_stats$zero_count, zero_stats$positive_count),
+  percentage = c(zero_stats$zero_rate * 100, zero_stats$positive_rate * 100)
+)
+
+# Create the visualization with key statistics in caption
+ggplot(zero_positive_data, aes(x = category, y = percentage, fill = category)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("Zero Strikes" = viridis(10)[2], 
+                               "Positive Strikes" = viridis(10)[8])) +
+  labs(
+    title = "Distribution of Strike Activity",
+    subtitle = paste0("Mean: ", round(zero_stats$mean_count, 3), " strikes/week | ",
+                      "Overdispersion ratio: ", round(zero_stats$overdispersion_ratio, 1), 
+                      " (variance >> mean)"),
+    x = "Strike Count",
+    y = "Percentage of Region-Weeks"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11)
+  ) +
+  ylim(0, max(zero_positive_data$percentage) * 1.1)
+```
+
+## Strike counts
+
+```{r}
+#| label: positive-distribution-plot
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+
+# Create histogram of positive counts (capped at reasonable range for visualization)
+positive_data <- adm_week_full |>
+  filter(strike_count > 0) |>
+  mutate(
+    strike_count_capped = pmin(strike_count, 10)  # Cap at 10 for better visualization
+  )
+
+# Calculate summary statistics for the note
+positive_mean <- mean(adm_week_full$strike_count[adm_week_full$strike_count > 0])
+positive_median <- median(adm_week_full$strike_count[adm_week_full$strike_count > 0])
+positive_total <- sum(adm_week_full$strike_count > 0)
+
+ggplot(positive_data, aes(x = strike_count_capped)) +
+  geom_histogram(bins = 10, alpha = 0.8, fill = viridis(10)[8]) +
+  scale_x_continuous(breaks = 1:10, labels = c(1:9, "10+")) +
+  labs(
+    title = "Distribution of Positive Strike Counts",
+    subtitle = paste0(format(positive_total, big.mark = ","), " region-weeks with strikes > 0"),
+    x = "Strike Count",
+    y = "Frequency"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11)
+  )
+```
+
+## Geographic concentration
+
+```{r}
+#| label: geographic-concentration-plot
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+
+# Top regions by total strike activity
+top_regions <- adm_week_full |>
+  group_by(action_geo_adm1_code, action_geo_country_code) |>
+  summarise(
+    total_strikes = sum(strike_count),
+    positive_weeks = sum(strike_count > 0),
+    .groups = "drop"
+  ) |>
+  arrange(desc(total_strikes)) |>
+  head(15)
+
+# Calculate concentration metrics
+total_strikes_all <- sum(adm_week_full$strike_count)
+top_15_strikes <- sum(top_regions$total_strikes)
+concentration_pct <- round(top_15_strikes / total_strikes_all * 100, 1)
+
+# Plot top regions by strike activity
+top_regions_plot <- top_regions |>
+  head(10) |>
+  mutate(
+    region_label = paste0(action_geo_country_code, "-", str_sub(action_geo_adm1_code, 1, 8)),
+    region_label = fct_reorder(region_label, total_strikes)
+  )
+
+ggplot(top_regions_plot, aes(x = total_strikes, y = region_label)) +
+  geom_col(alpha = 0.8, fill = viridis(10)[3]) +
+  labs(
+    title = "Top 10 Regions by Total Strike Activity",
+    subtitle = paste0("Top 15 regions account for ", concentration_pct, "% of all strikes"),
+    x = "Total Strikes",
+    y = "Region (Country-ADM1)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10)
+  )
+```
+
+## Time trends
+
+```{r}
+#| label: temporal-concentration-plot
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+
+# Aggregate strikes by week for time series
+weekly_totals <- adm_week_full |>
+  group_by(date) |>
+  summarise(
+    total_strikes = sum(strike_count),
+    regions_with_strikes = sum(strike_count > 0),
+    .groups = "drop"
+  )
+
+# Calculate temporal statistics
+mean_weekly_strikes <- mean(weekly_totals$total_strikes)
+cv_weekly_strikes <- sd(weekly_totals$total_strikes) / mean_weekly_strikes
+peak_week_date <- weekly_totals$date[which.max(weekly_totals$total_strikes)]
+peak_week_strikes <- max(weekly_totals$total_strikes)
+
+# Time series plot of weekly strike totals
+ggplot(weekly_totals, aes(x = date, y = total_strikes)) +
+  geom_line(color = viridis(10)[3], alpha = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = viridis(10)[8], linewidth = 1.2) +
+  labs(
+    title = "Global Strike Activity Over Time",
+    subtitle = paste0("Mean: ", round(mean_weekly_strikes, 1), " strikes/week | ",
+                      "CV: ", round(cv_weekly_strikes, 2), " (high variability)"),
+    x = "Date",
+    y = "Total Weekly Strikes"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11)
+  )
+```
+
+## Temporal stats
+
+```{r}
+# Create temporal statistics table
+temporal_stats <- tibble(
+  Metric = c("Mean strikes per week", "Coefficient of variation", "Peak week", "Peak week strikes"),
+  Value = c(
+    paste0(round(mean_weekly_strikes, 1), " strikes"),
+    paste0(round(cv_weekly_strikes, 2), " (high variability)"),
+    as.character(peak_week_date),
+    paste0(peak_week_strikes, " strikes")
+  )
+)
+
+kable(temporal_stats)
+```
+
+## Why this matters for modeling {.smaller}
+
+- **Zero-inflation (98% zeros)** → Need distributions that handle excess zeros (Tweedie, hurdle models)
+- **Overdispersion (variance >> mean)** → Can't use plain Poisson regression  
+- **Geographic concentration** → Need spatial features and regional fixed effects
+- **Temporal clustering** → Need lagged features and time trends
+- **Panel structure** → Need models that account for repeated observations per region
+
+# Part 3: Modeling Strategy
+
+## Modeling rare events
+
+**Data characteristics:**
+
+- Zero-inflated count data 
+- Overdispersion (variance >> mean)
+- Panel structure: 1,550 ADM1 regions 
+
+**Task:** Predict weekly strike counts at the ADM1 geographic level
+
+## Modeling approaches: Single-stage
+
+**Single-stage models** predict counts directly in one step:
+
+- **Native count distributions**: Poisson, Tweedie GLMs
+- **Log-transformed targets**: log1p(count) + backtransform
+  - Linear model (LM)
+  - Elastic net (GLMNET)
+  - Gradient boosting (LightGBM, XGBoost)
+
+## Modeling approaches: Two-stage (hurdle) {.smaller}
+
+**Two-stage (hurdle) models** decompose prediction into:
+
+1. **Stage 1 (Occurrence)**: Classify P(strike > 0)
+   - Logistic regression (GLM, GLMNET)
+   - Tree-based classifiers (LightGBM, XGBoost)
+
+2. **Stage 2 (Severity)**: Predict count given occurrence
+   - Gamma regression (LightGBM, XGBoost)
+   - Log-transformed models (LM, GLMNET, LightGBM, XGBoost)
+
+3. **Combine**: E[count] = P(occurrence) × E[severity | occurrence]
+
+## Features: Temporal {.smaller}
+
+**Seasonality and trends:**
+
+- Calendar effects: Month, quarter, and year-end indicators
+- Long-term patterns: 10-year cyclical trends encoded via sine/cosine transformations
+- Linear time trend to capture overall trajectory
+
+**Lagged strike activity:**
+
+- Recent history: Strike counts from 1, 2, and 4 weeks prior
+- Smoothed trends: Rolling averages over 4 and 8 weeks
+- Capture strong temporal autocorrelation in strike occurrence
+
+## Features: Media and actors {.smaller}
+
+**Media coverage (lagged):**
+
+- Volume: Total news articles and event mentions
+- Sentiment: Average tone of news coverage
+- Capture media attention and public sentiment around labor activity
+
+**Actor characteristics:**
+
+- Diversity: Number of unique actor types involved
+- Composition: Proportions of government, labor, and civil society actors
+- Measure coordination and coalition formation
+
+## Features: Spatial and geographic {.smaller}
+
+**Spatial spillovers:**
+
+- Country-level: Total strikes across the country (lag 1)
+- Contiguous regions: Strike counts in immediately adjacent areas
+- Distance-weighted: Inverse distance-weighted strikes within 500km radius
+- Capture spatial diffusion and regional coordination
+
+**Geographic controls:**
+
+- Fixed effects for ADM1 regions and countries
+- Accounts for persistent regional heterogeneity
+
+## Tidymodels overview
+
+**Tidymodels** provides a unified framework for modeling in R:
+
+- **recipes**: Feature engineering and preprocessing
+- **parsnip**: Unified model specification interface
+- **workflows**: Combine recipes and models
+- **tune**: Hyperparameter optimization
+- **yardstick**: Model evaluation metrics
+
+Enables consistent workflow across different model types and engines.
+
+## Tidymodels: Recipe example {.smaller}
+
+```{r}
+#| label: recipe-example
+#| echo: true
+#| eval: false
+
+tree_recipe <- recipe(strike_count ~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.999) |>
+  step_zv(all_predictors())
+```
+
+**Key steps**: Handle novel levels, pool rare categories, create dummies, impute missing values, remove collinearity
+
+## Tidymodels: Model specification {.smaller}
+
+```{r}
+#| label: model-spec-example
+#| echo: true
+#| eval: false
+
+# Linear model on log-transformed target
+lm_log_spec <- linear_reg() |> 
+  set_engine("lm") |> 
+  set_mode("regression")
+
+# LightGBM with Tweedie objective for count data
+lgbm_twd_spec <- boost_tree(
+  trees = tune(), 
+  tree_depth = tune(), 
+  min_n = tune(),
+  loss_reduction = tune(), 
+  sample_size = tune(), 
+  mtry = tune(), 
+  learn_rate = tune()
+) |>
+  set_engine("lightgbm", 
+             objective = "tweedie", 
+             tweedie_variance_power = 1.3,
+             num_threads = 1)
+```
+
+**Parsnip** provides unified interface across engines (lm, glmnet, xgboost, lightgbm, etc.)
+
+## Tidymodels: Workflows {.smaller}
+
+```{r}
+#| label: workflow-example
+#| echo: true
+#| eval: false
+
+# Combine model specification and recipe
+wf_lm_log <- workflow() |> 
+  add_model(lm_log_spec) |> 
+  add_recipe(lm_log_recipe)
+
+# Tune hyperparameters on resamples
+tuned_lgbm <- tune_grid(
+  wf_lgbm_twd,
+  resamples = val_resamples,
+  grid = grid_boosted,
+  metrics = metric_set(rmse, mae, rsq),
+  control = control_grid(save_pred = FALSE, verbose = TRUE)
+)
+
+# Select best configuration
+best_config <- select_best(tuned_lgbm, metric = "rmse")
+final_wf <- finalize_workflow(wf_lgbm_twd, best_config)
+```
+
+**Workflows** bundle preprocessing and modeling for reproducible pipelines
+
+## Cross-validation strategy {.smaller}
+
+**Expanding window approach:**
+
+- 3 rolling-origin folds
+- Each fold: 26-week assessment period
+- Training set grows with each fold (preserves temporal ordering)
+- Uses all available historical data for each forecast
+
+**Why expanding?**
+
+- Respects real-world time series structure
+- Maximizes training data for recent predictions
+- Avoids look-ahead bias
+
+## Hyperparameter tuning {.smaller}
+
+**Boosted trees (LightGBM/XGBoost):** 24 configurations
+
+- `trees`: 200-600
+- `tree_depth`: 3-8
+- `min_n`: 2-20
+- `loss_reduction`: 0-5
+- `sample_size`: 0.6-0.9
+- `mtry`: 2-12
+- `learn_rate`: 0.001-0.1 (log scale)
+
+**GLMNET:** 50 configurations (10 penalty × 5 mixture levels)
+
+**Selection metrics:** Both RMSE and MAE tested (results robust)
+
+## Log model bias correction {.smaller}
+
+**Problem:** log1p transformation introduces bias on back-transform
+
+- Naive: ŷ = exp(log_pred) - 1
+- Jensen's inequality: E[exp(X)] ≠ exp(E[X])
+
+**Solution:** Duan's smearing estimator
+
+1. Fit model on log1p(count)
+2. Compute residuals: ε = log1p(count) - log_pred
+3. Smearing factor: σ = mean(exp(ε))
+4. Corrected prediction: ŷ = (exp(log_pred) × σ) - 1
+
+**Result:** Unbiased predictions on original scale
+
+# Part 4: Results
+
+```{r}
+#| label: visualization-setup
+
+library(tidyverse)
+library(ggplot2)
+library(arrow)
+library(patchwork)
+library(scales)
+library(viridis)
+
+# Set theme
+theme_set(theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 11, face = "bold")
+  ))
+
+# Define colors
+model_colors <- c(
+  "Single-stage" = viridis::turbo(10)[3],
+  "Two-stage" = viridis::turbo(10)[8],
+  "Baseline" = viridis::turbo(10)[2]
+)
+
+# Load data
+sst_val_summary <- read_csv(file.path(root, "model_outputs/sst_val_summary_rmse.csv"), show_col_types = FALSE)
+tsr_joint_opt <- read_csv(file.path(root, "model_outputs/tsr_joint_optimization_results__rmse.csv"), show_col_types = FALSE)
+sst_naive_val <- read_csv(file.path(root, "model_outputs/sst_naive_baselines_validation.csv"), show_col_types = FALSE)
+
+# Prepare single-stage data
+sst_val_plot <- sst_val_summary |>
+  mutate(
+    model_type = "Single-stage",
+    model_name = case_when(
+      model == "lm_log" ~ "LM log1p",
+      model == "glmnet_log" ~ "GLMNET log1p", 
+      model == "lgbm_log" ~ "LightGBM log1p",
+      model == "xgb_log" ~ "XGBoost log1p",
+      model == "xgb_poi" ~ "XGBoost Poisson",
+      model == "lgbm_poi" ~ "LightGBM Poisson",
+      model == "lgbm_twd" ~ "LightGBM Tweedie",
+      TRUE ~ model
+    ),
+    is_best = model == "lgbm_twd"
+  )
+
+# Prepare two-stage data
+tsr_val_plot <- tsr_joint_opt |>
+  head(10) |>
+  mutate(
+    model_type = "Two-stage",
+    model_name = case_when(
+      classifier == "glm" & severity_model == "gamma_xgb" ~ "GLM + Gamma XGBoost",
+      classifier == "glm" & severity_model == "lgbm_log" ~ "GLM + LightGBM log1p",
+      classifier == "glm" & severity_model == "gamma_lgbm" ~ "GLM + Gamma LightGBM",
+      classifier == "glm" & severity_model == "xgb_log" ~ "GLM + XGBoost log1p",
+      classifier == "glm" & severity_model == "glmnet_log" ~ "GLM + GLMNET log1p",
+      classifier == "glm" & severity_model == "lm_log" ~ "GLM + LM log1p",
+      classifier == "lgbm" & severity_model == "lm_log" ~ "LightGBM + LM log1p",
+      classifier == "lgbm" & severity_model == "glmnet_log" ~ "LightGBM + GLMNET log1p",
+      classifier == "lgbm" & severity_model == "gamma_lgbm" ~ "LightGBM + Gamma LightGBM",
+      classifier == "lgbm" & severity_model == "gamma_xgb" ~ "LightGBM + Gamma XGBoost",
+      TRUE ~ paste(classifier, "+", severity_model)
+    ),
+    is_best = row_number() == 1
+  )
+```
+
+## Naive models
+
+```{r}
+#| label: fig0-naive-baselines
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+
+# Prepare naive models data
+naive_comparison <- sst_naive_val |>
+  mutate(
+    model_name = case_when(
+      model == "naive_rolling_4wk" ~ "Rolling 4-week",
+      model == "naive_rolling_8wk" ~ "Rolling 8-week",
+      model == "naive_mean" ~ "Mean",
+      model == "naive_median" ~ "Median",
+      model == "naive_zero" ~ "Zero",
+      model == "naive_persistence" ~ "Persistence",
+      TRUE ~ model
+    ),
+    model_name = fct_reorder(model_name, -rmse)
+  )
+
+# Create plots
+p1 <- ggplot(naive_comparison, aes(x = rmse, y = model_name)) +
+  geom_point(size = 3, color = model_colors["Baseline"]) +
+  labs(title = "RMSE") +
+  theme(axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(naive_comparison, aes(x = mae, y = model_name)) +
+  geom_point(size = 3, color = model_colors["Baseline"]) +
+  labs(title = "MAE") +
+  theme(axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+(p1 | p2)
+```
+
+## Validation results
+
+```{r}
+#| label: fig1-validation-all-models
+#| fig-align: center
+
+# Prepare baselines
+baseline_val <- sst_naive_val |>
+  filter(model %in% c("naive_rolling_8wk", "naive_mean")) |>
+  mutate(
+    model_type = "Baseline",
+    model_name = case_when(
+      model == "naive_rolling_8wk" ~ "Rolling 8wk",
+      model == "naive_mean" ~ "Mean",
+      TRUE ~ model
+    ),
+    is_best = model == "naive_rolling_8wk"
+  )
+
+# Combine all
+val_comparison <- bind_rows(
+  sst_val_plot |> select(model_name, model_type, rmse, mae, rsq, is_best),
+  tsr_val_plot |> select(model_name, model_type, rmse = combined_rmse, mae = combined_mae, rsq = combined_rsq, is_best),
+  baseline_val |> select(model_name, model_type, rmse, mae, rsq, is_best)
+) |>
+  mutate(
+    model_name = fct_reorder(model_name, -rmse),
+    model_type = fct_relevel(model_type, "Single-stage", "Two-stage", "Baseline"),
+    selection_status = if_else(is_best, "Selected Model", "Not Selected")
+  )
+
+# Create plots
+p1 <- ggplot(val_comparison, aes(x = rmse, y = model_name, color = model_type, size = selection_status)) +
+  geom_point() +
+  scale_color_manual(values = model_colors, name = "Model Type") +
+  scale_size_manual(values = c("Not Selected" = 2, "Selected Model" = 3), name = "Selection") +
+  guides(color = guide_legend(order = 1), size = guide_legend(order = 2)) +
+  labs(title = "RMSE") +
+  theme(legend.position = "right",
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+p2 <- ggplot(val_comparison, aes(x = mae, y = model_name, color = model_type, size = selection_status)) +
+  geom_point() +
+  scale_color_manual(values = model_colors, name = "Model Type") +
+  scale_size_manual(values = c("Not Selected" = 2, "Selected Model" = 3), name = "Selection") +
+  guides(color = guide_legend(order = 1), size = guide_legend(order = 2)) +
+  labs(title = "MAE") +
+  theme(legend.position = "right",
+        axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+p3 <- ggplot(val_comparison, aes(x = rsq, y = model_name, color = model_type, size = selection_status)) +
+  geom_point() +
+  scale_color_manual(values = model_colors, name = "Model Type") +
+  scale_size_manual(values = c("Not Selected" = 2, "Selected Model" = 3), name = "Selection") +
+  scale_x_continuous(labels = percent_format()) +
+  guides(color = guide_legend(order = 1), size = guide_legend(order = 2)) +
+  labs(title = "R²") +
+  theme(legend.position = "right",
+        axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        plot.title = element_text(hjust = 0.5))
+
+(p1 | p2 | p3) + plot_layout(guides = "collect") & theme(legend.position = "right")
+```
+
+## Non-zero performance comparison
+
+```{r}
+#| label: fig3-nonzero-performance
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+#| fig-width: 10
+#| fig-height: 6
+
+# Load data
+sst_val_separate <- read_csv(file.path(root, "model_outputs/sst_val_separate_metrics_rmse.csv"), show_col_types = FALSE)
+tsr_stage2_metrics <- read_csv(file.path(root, "model_outputs/tsr_stage2_severity_metrics__rmse.csv"), show_col_types = FALSE)
+
+# All models list
+all_models <- c(
+  "LM log1p", "GLMNET log1p", "LightGBM log1p", "XGBoost log1p",
+  "XGBoost Poisson", "LightGBM Tweedie",
+  "Gamma LightGBM", "Gamma XGBoost"
+)
+
+# Prepare single-stage data
+sst_nonzero_plot <- sst_val_separate |>
+  filter(week_type == "non_zero", .metric == "rmse", model != "lgbm_poi") |>
+  select(model, rmse = .estimate) |>
+  mutate(
+    model_name = case_when(
+      model == "lm_log" ~ "LM log1p",
+      model == "glmnet_log" ~ "GLMNET log1p", 
+      model == "lgbm_log" ~ "LightGBM log1p",
+      model == "xgb_log" ~ "XGBoost log1p",
+      model == "xgb_poi" ~ "XGBoost Poisson",
+      model == "lgbm_twd" ~ "LightGBM Tweedie",
+      TRUE ~ model
+    ),
+    model_type = "Single-stage",
+    is_best = model == "lgbm_twd"
+  )
+
+# Prepare two-stage data
+tsr_stage2_plot <- tsr_stage2_metrics |>
+  select(model, rmse) |>
+  mutate(
+    model_name = case_when(
+      model == "gamma_lgbm" ~ "Gamma LightGBM",
+      model == "gamma_xgb" ~ "Gamma XGBoost", 
+      model == "lgbm_log" ~ "LightGBM log1p",
+      model == "xgb_log" ~ "XGBoost log1p",
+      model == "glmnet_log" ~ "GLMNET log1p",
+      model == "lm_log" ~ "LM log1p",
+      TRUE ~ model
+    ),
+    model_type = "Stage 2",
+    is_best = model == "gamma_lgbm"
+  )
+
+# Create comparison dataframe
+comparison_data <- tibble(
+  model_name = factor(all_models, levels = rev(all_models)),
+  single_stage_rmse = NA_real_,
+  stage2_rmse = NA_real_,
+  single_stage_selected = FALSE,
+  stage2_selected = FALSE
+)
+
+# Fill in values
+for(i in seq_along(sst_nonzero_plot$model_name)) {
+  idx <- which(comparison_data$model_name == sst_nonzero_plot$model_name[i])
+  if(length(idx) > 0) {
+    comparison_data$single_stage_rmse[idx] <- sst_nonzero_plot$rmse[i]
+    comparison_data$single_stage_selected[idx] <- sst_nonzero_plot$is_best[i]
+  }
+}
+
+for(i in seq_along(tsr_stage2_plot$model_name)) {
+  idx <- which(comparison_data$model_name == tsr_stage2_plot$model_name[i])
+  if(length(idx) > 0) {
+    comparison_data$stage2_rmse[idx] <- tsr_stage2_plot$rmse[i]
+    comparison_data$stage2_selected[idx] <- tsr_stage2_plot$is_best[i]
+  }
+}
+
+# Pivot to long
+plot_data <- comparison_data |>
+  pivot_longer(
+    cols = c(single_stage_rmse, stage2_rmse),
+    names_to = "model_type",
+    values_to = "rmse",
+    values_drop_na = TRUE
+  ) |>
+  mutate(
+    model_type = case_when(
+      model_type == "single_stage_rmse" ~ "Single-stage",
+      model_type == "stage2_rmse" ~ "Stage 2"
+    ),
+    is_selected = case_when(
+      model_type == "Single-stage" ~ single_stage_selected,
+      model_type == "Stage 2" ~ stage2_selected
+    ),
+    selection_status = if_else(is_selected, "Selected Model", "Not Selected")
+  )
+
+# Create plot
+ggplot(plot_data, aes(x = rmse, y = model_name, color = model_type, size = selection_status)) +
+  geom_point() +
+  scale_color_manual(values = c("Single-stage" = viridis::turbo(10)[3], "Stage 2" = viridis::turbo(10)[8]), name = "Model Type") +
+  scale_size_manual(values = c("Not Selected" = 3.5, "Selected Model" = 5), name = "Selection") +
+  guides(color = guide_legend(order = 1), size = guide_legend(order = 2)) +
+  labs(
+    x = "RMSE",
+    y = "Model"
+  ) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5)
+  )
+```
+
+## Test set performance (best model)
+
+```{r}
+#| label: fig2-test-best-models
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+
+# Load test data
+sst_model_metadata <- read_csv(file.path(root, "model_outputs/sst_model_metadata_rmse.csv"), show_col_types = FALSE)
+tsr_test_combined <- read_csv(file.path(root, "model_outputs/two_stage_refined_test_combined__rmse.csv"), show_col_types = FALSE)
+sst_naive_test <- read_csv(file.path(root, "model_outputs/sst_naive_baselines_test.csv"), show_col_types = FALSE)
+
+# Prepare data
+best_models <- tibble(
+  model_name = c("LightGBM Tweedie", "GLM + Gamma LGBM", "Rolling 8wk"),
+  model_type = c("Single-stage", "Two-stage", "Baseline"),
+  val_rmse = c(sst_val_summary$rmse[sst_val_summary$model == "lgbm_twd"], 
+               tsr_joint_opt$combined_rmse[1],
+               sst_naive_val$rmse[sst_naive_val$model == "naive_rolling_8wk"]),
+  test_rmse = c(sst_model_metadata$test_rmse[1],
+                tsr_test_combined$.estimate[tsr_test_combined$.metric == "rmse"],
+                sst_naive_test$rmse[sst_naive_test$model == "naive_rolling_8wk"]),
+  val_mae = c(sst_val_summary$mae[sst_val_summary$model == "lgbm_twd"],
+              tsr_joint_opt$combined_mae[1], 
+              sst_naive_val$mae[sst_naive_val$model == "naive_rolling_8wk"]),
+  test_mae = c(sst_model_metadata$test_mae[1],
+               tsr_test_combined$.estimate[tsr_test_combined$.metric == "mae"],
+               sst_naive_test$mae[sst_naive_test$model == "naive_rolling_8wk"]),
+  val_rsq = c(sst_val_summary$rsq[sst_val_summary$model == "lgbm_twd"],
+              tsr_joint_opt$combined_rsq[1],
+              sst_naive_val$rsq[sst_naive_val$model == "naive_rolling_8wk"]),
+  test_rsq = c(sst_model_metadata$test_rsq[1],
+               tsr_test_combined$.estimate[tsr_test_combined$.metric == "rsq"],
+               sst_naive_test$rsq[sst_naive_test$model == "naive_rolling_8wk"])
+) |>
+  pivot_longer(cols = starts_with(c("val_", "test_")), 
+               names_to = c("dataset", "metric"), 
+               names_sep = "_") |>
+  pivot_wider(names_from = metric, values_from = value) |>
+  mutate(
+    model_name = fct_relevel(model_name, "LightGBM Tweedie", "GLM + Gamma LGBM", "Rolling 8wk"),
+    dataset = fct_relevel(dataset, "val", "test")
+  )
+
+# Create plots
+p_rmse <- ggplot(best_models, aes(x = model_name, y = rmse, fill = dataset)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("val" = viridis::turbo(10)[1], "test" = viridis::turbo(10)[9]), 
+                    labels = c("Validation", "Test")) +
+  labs(title = "RMSE", fill = "Dataset") +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+p_mae <- ggplot(best_models, aes(x = model_name, y = mae, fill = dataset)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("val" = viridis::turbo(10)[1], "test" = viridis::turbo(10)[9]),
+                    labels = c("Validation", "Test")) +
+  labs(title = "MAE", fill = "Dataset") +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+p_rsq <- ggplot(best_models, aes(x = model_name, y = rsq, fill = dataset)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("val" = viridis::turbo(10)[1], "test" = viridis::turbo(10)[9]),
+                    labels = c("Validation", "Test")) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "R²", fill = "Dataset") +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+(p_rmse | p_mae | p_rsq) + plot_layout(guides = "collect")
+```
+
+## Predictions vs actuals (Tweedie)
+
+```{r}
+#| label: fig4-time-series
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+#| fig-width: 18
+#| fig-height: 7
+
+# Load data
+tsr_test_predictions <- read_parquet(file.path(root, "model_outputs/two_stage_refined_test_predictions__rmse.parquet"))
+sst_predictions <- read_parquet(file.path(root, "model_outputs/sst_predictions__rmse.parquet"))
+
+# Aggregate to weekly totals
+weekly_tsr <- tsr_test_predictions |>
+  group_by(date) |>
+  summarise(
+    actual_total = sum(actual_count, na.rm = TRUE),
+    tsr_pred_total = sum(expected_count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+weekly_sst <- sst_predictions |>
+  group_by(date) |>
+  summarise(
+    sst_pred_total = sum(.pred, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Join
+time_series_data <- weekly_tsr |>
+  left_join(weekly_sst, by = "date") |>
+  select(date, actual = actual_total, sst_pred = sst_pred_total) |>
+  pivot_longer(cols = c(actual, sst_pred), 
+               names_to = "series", values_to = "count") |>
+  mutate(
+    series = case_when(
+      series == "actual" ~ "Actual",
+      series == "sst_pred" ~ "Single-stage (LightGBM Tweedie)"
+    ),
+    series = fct_relevel(series, "Actual", "Single-stage (LightGBM Tweedie)")
+  )
+
+# Time series plot
+fig4a <- ggplot(time_series_data, aes(x = date, y = count, color = series, linetype = series)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c("Actual" = "black", 
+                                "Single-stage (LightGBM Tweedie)" = viridis::turbo(10)[3])) +
+  scale_linetype_manual(values = c("Actual" = "solid",
+                                   "Single-stage (LightGBM Tweedie)" = "solid")) +
+  labs(
+    title = "A) Weekly Aggregated Time Series",
+    subtitle = "Sum across all 1,550 ADM1 regions per week",
+    x = "Date",
+    y = "Total Strike Count",
+    color = "Series",
+    linetype = "Series"
+  ) +
+  theme(legend.position = "bottom")
+
+# Region-level scatter
+tsr_data <- tsr_test_predictions |>
+  select(actual_count, expected_count)
+
+sst_data <- sst_predictions |>
+  select(.pred)
+
+region_data <- bind_cols(
+  tsr_data,
+  sst_data |> rename(sst_pred = .pred)
+) |>
+  select(actual = actual_count, sst_pred)
+
+# Scatter plot
+fig4b <- ggplot(region_data, aes(x = actual, y = sst_pred)) +
+  geom_hex(bins = 30, alpha = 0.8) +
+  scale_fill_viridis_c(option = "turbo", name = "Count", trans = "log10",
+                       begin = 0.2, end = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 1, color = "black") +
+  labs(
+    title = "B) Region-Level Calibration",
+    subtitle = "80,600 region-week predictions",
+    x = "Actual Strike Count",
+    y = "Predicted Strike Count"
+  ) +
+  theme(legend.position = "right")
+
+# Combine
+library(patchwork)
+fig4a | fig4b
+```
+
+## Feature importance (Tweedie)
+
+```{r}
+#| label: fig5-feature-importance
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+
+library(tidymodels)
+library(vip)
+
+# Load model
+best_model_fit <- readRDS(file.path(root, "model_outputs/sst_best_fitted_model_rmse.rds"))
+
+# Extract feature importance from LightGBM Tweedie model
+importance_df <- vip::vi_model(best_model_fit) |>
+  arrange(desc(Importance)) |>
+  head(15) |>
+  mutate(
+    feature_clean = case_when(
+      str_detect(Variable, "strike_count_lag1") ~ "Strike Count (lag 1)",
+      str_detect(Variable, "strike_count_lag2") ~ "Strike Count (lag 2)", 
+      str_detect(Variable, "strike_count_lag4") ~ "Strike Count (lag 4)",
+      str_detect(Variable, "rolling_avg_4wk") ~ "Rolling 4-week Average",
+      str_detect(Variable, "rolling_avg_8wk") ~ "Rolling 8-week Average",
+      str_detect(Variable, "total_articles_lag1") ~ "Total Articles (lag 1)",
+      str_detect(Variable, "total_articles_lag2") ~ "Total Articles (lag 2)",
+      str_detect(Variable, "total_mentions_lag1") ~ "Total Mentions (lag 1)",
+      str_detect(Variable, "total_mentions_lag2") ~ "Total Mentions (lag 2)",
+      str_detect(Variable, "avg_tone_lag1") ~ "Average Tone (lag 1)",
+      str_detect(Variable, "avg_tone_lag2") ~ "Average Tone (lag 2)",
+      str_detect(Variable, "actor_diversity_lag1") ~ "Actor Diversity (lag 1)",
+      str_detect(Variable, "country_strikes_lag1") ~ "Country Strikes (lag 1)",
+      str_detect(Variable, "contig_strikes_t1") ~ "Contiguous Strikes (t-1)",
+      str_detect(Variable, "distw_strikes_t1") ~ "Distance-weighted Strikes (t-1)",
+      str_detect(Variable, "time_trend") ~ "Time Trend",
+      TRUE ~ str_replace_all(Variable, "_", " ") |> str_to_title()
+    ),
+    feature_clean = fct_reorder(feature_clean, Importance)
+  )
+
+# Create plot
+ggplot(importance_df, aes(x = Importance, y = feature_clean)) +
+  geom_col(alpha = 0.8, fill = viridis::turbo(10)[3]) +
+  labs(
+    title = "Feature Importance: LightGBM Tweedie",
+    subtitle = "Gain-based importance for top 15 predictors",
+    x = "Importance (Gain)",
+    y = "Feature"
+  ) +
+  theme(
+    legend.position = "right",
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11)
+  )
+```
+
+## Key findings {.smaller}
+
+**Model performance:**
+
+- Best model: **LightGBM Tweedie** (test RMSE: 0.257, 2% better than baseline)
+- Two-stage models showed promise on validation but collapsed on test data
+- Single-stage Tweedie proved more robust to distributional shift
+
+**Distributional shift challenge:**
+
+- Training data (2015-2024): 2.2% strike rate, mean count = 0.037
+- Test data (late 2024-2025): 1.5% strike rate, mean count = 0.023
+- **33% decline in strike frequency** between training and test periods
+- Two-stage models failed to adapt, predicting near-constant values
+
+## Key findings {.smaller}
+
+**Important predictors:**
+
+- Temporal lags (lag1, rolling averages) dominate importance
+- Media coverage (articles, mentions) moderately important  
+- Spatial spillovers (contiguous, distance-weighted) contribute
+- Geographic fixed effects capture regional heterogeneity
+
+**Takeaway:** Single-stage models may handle rare events more robustly than hurdle approaches when base rates are extremely low and unstable
+
+# Part 5: Future Directions
+
+## Improve data
+
+- **LLM-based filtering**: Use GPT/Claude to classify GKG themes and article content for strike relevance
+- **Article metadata analysis**: Extract structured data (industries, actors, strike types) from news articles  
+- **Multi-stage validation**: Combine GDELT codes + GKG themes + LLM classification for higher precision
+- **Active learning**: Use LLM confidence scores to identify borderline cases for human review
+
+## Add external features
+
+- **V-Dem**: Democracy indices, electoral competitiveness, civil liberties
+- **World Bank**: Unemployment, inflation, GDP growth, labor market indicators
+- **ILO**: Union density, collective bargaining coverage, labor regulations
+- **ACLED**: Protest intensity, government repression
+
+## Add external features
+
+**Challenges**: 
+
+- No direct merge key (GDELT uses bespoke ADM1 codes)
+- Temporal alignment (quarterly/annual vs weekly data)
+- Missing data
+
+## Narrow geographic focus
+
+<br>
+
+- Train only on regions with >1 strike per year (reduces dataset but improves signal)
+- Use country-level strike intensity as screening criteria
+- Focus on historically active labor regions (industrial centers, capitals)
+
+## GDELT tone measurement
+
+<br>
+
+**Current**: Dictionary-based sentiment (-100 to +100 scale, typically -10 to +10)
+
+**Limitations**: No context awareness, static dictionary
+
+**Modern ML**: Transformer models + LLMs with few-shot prompting for better context and domain adaptation
+
+## Capturing strike bursts
+
+<br>
+
+- **Quantile regression**: Predict 75th percentile instead of mean
+- **Momentum features**: Strike acceleration, rolling maximums  
+- **Extreme event classifier**: Separate model for counts > 5
+
+## Capturing strike bursts
+
+<br> 
+
+- Higher-threshold hurdle models (split at count > 2)
+- Asymmetric loss functions (penalize underprediction more heavily)
+- Ensemble quantile predictions (multiple percentiles)
