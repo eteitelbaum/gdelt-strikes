@@ -1,0 +1,115 @@
+---
+title: "Filter GDELT Events by Themes and URLS"
+format: html
+---
+
+# Filter by Themes
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(arrow)
+```
+
+## Create a List of Themes
+
+```{r}
+# Load the enriched GDELT dataset with themes
+gdelt_strikes_enriched <- read_parquet("data/enhanced/gdelt_strikes_enriched.parquet")
+
+# Explode themes into long format, drop offsets
+themes_long <- gdelt_strikes_enriched |>
+  select(GLOBALEVENTID, all_themes) |>
+  filter(!is.na(all_themes)) |>
+  separate_rows(all_themes, sep = ";") |>
+  mutate(all_themes = str_trim(all_themes)) |>
+  filter(all_themes != "") |>
+  mutate(theme = sub(",.*$", "", all_themes)) |>
+  distinct(GLOBALEVENTID, theme) |>
+  select(GLOBALEVENTID, theme)
+
+# Frequency table of unique themes
+theme_counts <- themes_long |>
+  count(theme, sort = TRUE)
+
+print(theme_counts, n = 100)
+
+# Export to CSV for review
+write_csv(theme_counts, "data/gdelt-themes/theme_counts.csv")
+```
+
+
+There are 12,113 themes in total. Let's try filtering first with some obvious keywords.
+
+```{r}
+# Candidate strike-related themes (first-pass via keywords)
+candidate_themes <- theme_counts %>%
+  filter(
+    str_detect(theme,
+      regex("STRIKE|WALKOUT|LOCKOUT|PICKET|PROTEST|DEMONSTRAT|UNION|BOYCOTT|UNREST|CONTRACT_DISPUTE",
+            ignore_case = TRUE)
+    )
+  ) %>%
+  filter(
+    !str_detect(theme, regex("DRONE_STRIKE", ignore_case = TRUE)),
+    !str_detect(theme, regex("^TAX_POLITICAL_PARTY_", ignore_case = TRUE)),
+    !str_detect(theme, regex("^TAX_TERROR_GROUP_", ignore_case = TRUE))
+  )
+```
+
+Step 1: Narrow down to strikes only by simply filtering for .
+
+```{r}
+# --- Define lists of inclusions / exclusions ---
+entry_terms <- c("STRIKE", "WALKOUT", "LOCKOUT", "PICKET", "UNION", "CONTRACT_DISPUTE")
+
+exclude_terms <- c("DRONE_STRIKE", "RELIGION", "PROTESTANT", "FREETRADE", 
+                   "CUSTOMS", "CREDIT", "HUNGERSTRIKE", "CONTRACT_DISPUTE", 
+                   "TEACHER")
+
+# --- Apply filtering ---
+strike_themes <- theme_counts |>
+  filter(str_detect(theme, regex(paste(entry_terms, collapse = "|"), ignore_case = TRUE))) |>
+  filter(!str_detect(theme, regex(paste(exclude_terms, collapse = "|"), ignore_case = TRUE))) |>
+  filter(!str_detect(theme, regex("^TAX_POLITICAL_PARTY_", ignore_case = TRUE))) |>
+  filter(!str_detect(theme, regex("^TAX_TERROR_GROUP_", ignore_case = TRUE))) |>
+  filter(!str_detect(theme, regex("^TAX_FNCACT_.*WORKER", ignore_case = TRUE)))   # keep workers for secondary use
+```
+
+```{r}
+# econdary analysis set — extract the worker categories separately
+worker_categories <- theme_counts %>%
+  filter(str_detect(theme, regex("^TAX_FNCACT_.*WORKER", ignore_case = TRUE)))
+```
+
+Step 2: Code for who was striking
+
+
+
+Step 3: Code for why the strike took place or issues that were at stake
+
+
+
+Step 4: Code for economic sectors affected
+
+
+
+Setp 5: Code for the nature of protest, e.g. violence, peaceful, etc. 
+
+
+
+## Create Strikes Dataset
+
+```{r}
+gdelt_strikes <- gdelt_strikes_enriched |>
+    filter(str_detect(all_themes, "STRIKE"))
+
+# Save to Parquet
+write_parquet(gdelt_strikes, "data/enhanced/gdelt_strikes.parquet")
+```
+
+
+## Create Labor-Related Protest Dataset

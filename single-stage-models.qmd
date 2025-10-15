@@ -1,0 +1,946 @@
+---
+title: "Single-Stage Baselines (Tweedie/Poisson/LM log1p)"
+format: html
+---
+
+**Metrics Implementation Notes:**
+
+- **Primary selection metrics**: MAE, RMSE, R² on original scale (validation uses pooled/micro-averaged metrics over all validation rows)
+- **Zero/non-zero reporting**: Computed from concatenated validation predictions (pooled) for each model
+- **Log-scale models**: Report log-scale R² as supplementary (uses saved `.pred_raw`); selection uses original-scale metrics
+- **Smearing correction**: Duan's smearing is applied consistently for log models in validation (per-fold factors from analysis residuals) and test (single factor from pretest residuals)
+- **Poisson/Tweedie GLMs**: Pseudo-R² (deviance-based) reported as supplementary
+- **Model selection**: Toggle between RMSE or MAE via `selection_metric`
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidymodels)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(bonsai)
+library(finetune)
+library(glmnet)
+library(janitor)
+library(doFuture)
+library(vip)
+
+# Set tidymodels and conflict preferences
+tidymodels_prefer()
+conflicted::conflicts_prefer(dplyr::lag)
+conflicted::conflicts_prefer(stringr::fixed)
+
+# Set parallel-safe RNG FIRST
+RNGkind("L'Ecuyer-CMRG")
+
+# Set base seed
+set.seed(2024)
+
+# Parallel backend setup
+registerDoFuture()
+plan(multisession, workers = 4)
+options(future.globals.maxSize = 8 * 1024^3)
+
+# Load helper functions
+source("helpers/helpers.R")
+
+# Prediction capping controls
+cap_predictions <- FALSE   # set TRUE to enable winsorization
+cap_quantile <- 0.999      # cap at this quantile of training response
+
+# Model selection metric toggle
+selection_metric <- "rmse"  # "rmse" or "mae" - metric used for model selection
+
+# Validation feature importance controls
+save_val_importance <- FALSE  # Skip slow permutation importance
+perm_importance_nsim <- 5
+```
+
+## Data and splits 
+
+```{r}
+#| label: data
+
+adm_full <- read_parquet("data/analysis/adm_week_full.parquet") |>
+  clean_names()
+
+predictor_cols <- adm_full |>
+  select(
+    action_geo_adm1_code, action_geo_country_code,
+    time_trend, year_sin, year_cos, month, quarter, is_year_end,
+    strike_count_lag1, strike_count_lag2, strike_count_lag4,
+    rolling_avg_4wk, rolling_avg_8wk,
+    total_articles_lag1, total_articles_lag2,
+    total_mentions_lag1, total_mentions_lag2,
+    avg_tone_lag1, avg_tone_lag2,
+    actor_diversity_lag1,
+    unique_actor1_types_lag1, unique_actor2_types_lag1,
+    prop_gov_lag1, prop_labor_lag1, prop_civil_lag1,
+    country_strikes_lag1, contig_strikes_t1, distw_strikes_t1
+  ) |>
+  names()
+
+model_df <- adm_full |>
+  select(date, strike_count, all_of(predictor_cols)) |>
+  arrange(date)
+
+all_weeks <- sort(unique(model_df$date))
+test_weeks <- tail(all_weeks, 52)
+pretest_df <- model_df |> filter(date < min(test_weeks))
+test_df <- model_df |> filter(date %in% test_weeks)
+
+assessment_weeks <- 26
+n_folds <- 3
+pretest_max <- max(pretest_df$date)
+assess_end_dates <- pretest_max - weeks(rev(seq(0, by = assessment_weeks, length.out = n_folds))) ## ?
+assess_start_dates <- assess_end_dates - weeks(assessment_weeks - 1)
+
+make_time_split <- function(df, start_date, end_date) {
+  analysis_idx <- which(df$date < start_date)
+  assessment_idx <- which(df$date >= start_date & df$date <= end_date)
+  rsample::make_splits(list(analysis = analysis_idx, assessment = assessment_idx), df) ## ?
+}
+
+val_splits <- map2(assess_start_dates, assess_end_dates, ~ make_time_split(pretest_df, .x, .y)) ## ?
+val_resamples <- rsample::manual_rset(val_splits, paste0("fold", seq_along(val_splits))) ## ?
+```
+
+## Main recipe
+
+```{r}
+#| label: recipe
+
+tree_recipe <- recipe(strike_count ~ ., data = pretest_df) |>
+  update_role(date, new_role = "id") |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.999) |>
+  step_zv(all_predictors())
+```
+
+## Model specifications
+
+```{r}
+#| label: models
+
+# Make racing metric match selection_metric to avoid mismatch warnings
+if (identical(selection_metric, "rmse")) {
+  reg_metrics <- metric_set(rmse, mae, rsq)
+} else if (identical(selection_metric, "mae")) {
+  reg_metrics <- metric_set(mae, rmse, rsq)
+} else {
+  stop("selection_metric must be 'rmse' or 'mae'")
+}
+
+# LM on log1p(count)
+lm_log_spec <- linear_reg() |> set_engine("lm") |> set_mode("regression")
+lm_log_recipe <- tree_recipe |>
+  step_log(strike_count, offset = 1, skip = TRUE)
+
+# GLMNET (log1p target)
+glmnet_log_spec <- linear_reg(
+  penalty = tune(),
+  mixture = tune()
+) |>
+  set_engine("glmnet") |>
+  set_mode("regression")
+
+# Base LightGBM specification
+base_lgbm <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_mode("regression")
+
+# LightGBM Tweedie (p=1.3 based on earlier validation results)
+lgbm_twd_spec <- base_lgbm |> set_engine("lightgbm", objective = "tweedie", tweedie_variance_power = 1.3, num_threads = 1)
+
+# LightGBM Poisson
+lgbm_poi_spec <- base_lgbm |> set_engine("lightgbm", objective = "poisson", num_threads = 1)
+
+# LightGBM L2 (log1p target)
+lgbm_l2_spec <- base_lgbm |> set_engine("lightgbm", objective = "regression", num_threads = 1)
+
+# Base XGBoost specification
+base_xgb <- boost_tree(
+  trees = tune(), tree_depth = tune(), min_n = tune(),
+  loss_reduction = tune(), sample_size = tune(), mtry = tune(), learn_rate = tune()
+) |>
+  set_mode("regression")
+
+# XGBoost Poisson
+xgb_poi_spec <- base_xgb |> set_engine("xgboost", objective = "count:poisson", tree_method = "hist", nthread = 1)
+
+# XGBoost L2 (log1p target)
+xgb_l2_spec <- base_xgb |> set_engine("xgboost", objective = "reg:squarederror", tree_method = "hist", nthread = 1)
+
+# Random Forest (log1p target)
+rf_log_spec <- rand_forest(
+  trees = tune(), mtry = tune(), min_n = tune()
+) |>
+  set_engine("ranger", num.threads = 1) |>
+  set_mode("regression")
+```
+
+## Tuning grids
+
+```{r}
+#| label: grids
+
+# LightGBM/XGBoost tuning grid
+grid_boosted <- grid_space_filling(    ## study these parameters
+  trees(range = c(200, 600)),
+  tree_depth(range = c(3, 8)),
+  min_n(range = c(2, 20)),
+  loss_reduction(range = c(0, 5)),
+  sample_size = sample_prop(range = c(0.6, 0.9)),
+  mtry(range = c(2, min(12, length(predictor_cols)))),
+  learn_rate(range = c(-3, -1), trans = log10_trans()),
+  size = 24
+)
+
+# Random Forest tuning grid
+grid_rf <- grid_space_filling(
+  trees(range = c(300, 1000)),
+  min_n(range = c(2, 20)),
+  mtry(range = c(2, min(12, length(predictor_cols)))),
+  size = 20
+)
+
+# GLMNET tuning grid
+grid_glmnet <- grid_regular(
+  penalty(range = c(-5, 0), trans = log10_trans()),
+  mixture(range = c(0, 1)),
+  levels = c(penalty = 10, mixture = 5)  # Named vector: 10 × 5 = 50 configs
+)
+```
+
+## Workflows
+
+```{r}
+#| label: workflows
+
+# LM log1p 
+wf_lm_log <- workflow() |> add_model(lm_log_spec) |> add_recipe(lm_log_recipe)
+
+# GLMNET log1p
+wf_glmnet_log <- workflow() |> add_model(glmnet_log_spec) |> add_recipe(lm_log_recipe)
+
+# LightGBM Poisson
+wf_lgbm_poi <- workflow() |> add_model(lgbm_poi_spec) |> add_recipe(tree_recipe)
+
+# LightGBM Tweedie
+wf_lgbm_twd <- workflow() |> add_model(lgbm_twd_spec) |> add_recipe(tree_recipe)  
+
+# LightGBM L2 (log1p target)
+wf_lgbm_log <- workflow() |> add_model(lgbm_l2_spec) |> add_recipe(lm_log_recipe)
+
+# XGBoost Poisson
+wf_xgb_poi <- workflow() |> add_model(xgb_poi_spec) |> add_recipe(tree_recipe)
+
+# XGBoost L2 (log1p target)
+wf_xgb_log <- workflow() |> add_model(xgb_l2_spec) |> add_recipe(lm_log_recipe)
+```
+
+## Tuning and validation
+
+```{r}
+#| label: tuning
+#| message: true
+#| warning: true
+
+# record start time
+start_time <- Sys.time()
+
+# Model selection toggles - edit this list to run only specific models
+models_to_run <- c(
+  "lm_log",      # Linear model on log1p
+  "glmnet_log",  # GLMNET on log1p
+  "lgbm_poi",    # LightGBM Poisson
+  "lgbm_twd",    # LightGBM Tweedie
+  "lgbm_log",    # LightGBM L2 on log1p
+  "xgb_poi",     # XGBoost Poisson
+  "xgb_log"      # XGBoost L2 on log1p
+)
+
+# Standard grid control (no racing)
+ctrl_grid <- control_grid(
+  save_pred = FALSE, verbose = TRUE, allow_par = TRUE,
+  parallel_over = "resamples", save_workflow = FALSE
+)  
+
+# Print warnings as they occur during tuning
+old_warn <- getOption("warn"); options(warn = 1)
+
+# Containers for fitted models, validation results, and predictions
+fitted_models <- list()
+val_results <- list()
+val_predictions <- list()
+
+# LM log 1p
+if ("lm_log" %in% models_to_run) {
+  cat("Prepping LM log model for validation...\n")
+  final_lm_log <- wf_lm_log  # No tuning required, just feed workflow to model object
+  # Refit and collect validation metrics
+  cat("Fitting LM log model across validation folds...\n")
+  lm_log_val <- collect_fold_metrics(
+    final_lm_log,
+    val_resamples$splits,
+    backtransform = function(x) pmax(expm1(x), 0),
+    model_type = "log",
+    use_smearing = TRUE,
+    split_ids = val_resamples$id,
+    model_name = "lm_log",
+    capture_last_fit = TRUE
+  )
+  # Get the last fold (full pretest data)
+  fitted_models$lm_log <- lm_log_val$last_fit
+  # Collect validation results
+  val_results$lm_log <- lm_log_val$metrics
+  val_predictions$lm_log <- lm_log_val$predictions
+} else {
+  cat(" Skipping LM log model\n")       
+  final_lm_log <- NULL
+}
+
+# GLMNET on log1p
+if ("glmnet_log" %in% models_to_run) {
+  cat(sprintf(" Tuning GLMNET (log1p)... (grid=%d, folds=%d)\n", nrow(grid_glmnet), nrow(val_resamples)))
+  cat(" Grid check - penalty levels:", length(unique(grid_glmnet$penalty)), "\n")
+  cat(" Grid check - mixture levels:", length(unique(grid_glmnet$mixture)), "\n")
+  cat(" Grid check - total configs:", nrow(grid_glmnet), "\n")
+  # Tuning with standard grid (no racing)
+  tuned_glmnet_log <- tune_grid(wf_glmnet_log, resamples = val_resamples, grid = grid_glmnet, metrics = reg_metrics, control = ctrl_grid)
+  # Persist tuning metrics and report evaluated counts
+  met_glmnet_log <- collect_metrics(tuned_glmnet_log)
+  readr::write_csv(met_glmnet_log, sprintf("model_outputs/sst_tuning_metrics_glmnet_log__%s.csv", selection_metric))
+  cat(" Post-tuning check - unique configs evaluated:", length(unique(met_glmnet_log$.config)), "of", nrow(grid_glmnet), "\n")
+  # Finalize workflow
+  final_glmnet_log <- finalize_workflow(wf_glmnet_log, select_best(tuned_glmnet_log, metric = selection_metric))
+  # Refit and collect validation metrics
+  cat("Re-fitting finalized model across validation folds for derived metrics...\n")
+  glmnet_log_val <- collect_fold_metrics(
+    final_glmnet_log,
+    val_resamples$splits,
+    backtransform = function(x) pmax(expm1(x), 0),
+    model_type = "log",
+    use_smearing = TRUE,
+    split_ids = val_resamples$id,
+    model_name = "glmnet_log",
+    capture_last_fit = TRUE
+  )
+  # Extract the fitted model from the last fold
+  fitted_models$glmnet_log <- glmnet_log_val$last_fit
+  # Collect validation results
+  val_results$glmnet_log <- glmnet_log_val$metrics
+  val_predictions$glmnet_log <- glmnet_log_val$predictions
+  cat("Done GLMNET (log1p).\n")
+} else {
+  cat(" Skipping GLMNET (log1p)\n")
+  tuned_glmnet_log <- NULL
+  final_glmnet_log <- NULL
+}
+
+# LightGBM Poisson
+if ("lgbm_poi" %in% models_to_run) {
+  cat(sprintf("Tuning LightGBM Poisson... (grid=%d, folds=%d)\n", nrow(grid_boosted), nrow(val_resamples)))
+  # Tuning with standard grid (no racing)
+  tuned_lgbm_poi <- tune_grid(wf_lgbm_poi, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
+  # Persist tuning metrics and report evaluated counts
+  met_lgbm_poi <- collect_metrics(tuned_lgbm_poi)
+  readr::write_csv(met_lgbm_poi, sprintf("model_outputs/sst_tuning_metrics_lgbm_poi__%s.csv", selection_metric))
+  cat(" Post-tuning check - unique configs evaluated:", length(unique(met_lgbm_poi$.config)), "of", nrow(grid_boosted), "\n")
+  # Finalize workflow
+  final_lgbm_poi <- finalize_workflow(wf_lgbm_poi, select_best(tuned_lgbm_poi, metric = selection_metric))
+  # Refit and collect validation metrics
+  cat("Re-fitting finalized model across validation folds for derived metrics...\n")
+  lgbm_poi_val <- collect_fold_metrics(
+    final_lgbm_poi,
+    val_resamples$splits,
+    backtransform = identity,
+    model_type = "poisson",
+    split_ids = val_resamples$id,
+    model_name = "lgbm_poi",
+    capture_last_fit = TRUE
+  )
+  # Extract the fitted model from the last fold
+  fitted_models$lgbm_poi <- lgbm_poi_val$last_fit
+  # Collect validation results
+  val_results$lgbm_poi <- lgbm_poi_val$metrics
+  val_predictions$lgbm_poi <- lgbm_poi_val$predictions
+  cat("Done LightGBM Poisson.\n")
+} else {
+  cat(" Skipping LightGBM Poisson\n")
+  tuned_lgbm_poi <- NULL
+  final_lgbm_poi <- NULL
+}
+
+# LightGBM Tweedie
+if ("lgbm_twd" %in% models_to_run) {
+  cat(sprintf("Tuning LightGBM Tweedie (p=1.3)... (grid=%d, folds=%d)\n", nrow(grid_boosted), nrow(val_resamples)))
+  # Tuning with standard grid (no racing)
+  tuned_lgbm_twd <- tune_grid(wf_lgbm_twd, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
+  # Persist tuning metrics and report evaluated counts
+  met_lgbm_twd <- collect_metrics(tuned_lgbm_twd)
+  readr::write_csv(met_lgbm_twd, sprintf("model_outputs/sst_tuning_metrics_lgbm_twd__%s.csv", selection_metric))
+  cat(" Post-tuning check - unique configs evaluated:", length(unique(met_lgbm_twd$.config)), "of", nrow(grid_boosted), "\n")
+  # Finalize workflow
+    final_lgbm_twd <- finalize_workflow(wf_lgbm_twd, select_best(tuned_lgbm_twd, metric = selection_metric))
+  # Refit and collect validation metrics
+  cat("Re-fitting finalized model across validation folds for derived metrics...\n")
+  lgbm_twd_val <- collect_fold_metrics(
+    final_lgbm_twd,
+    val_resamples$splits,
+    backtransform = identity,
+    model_type = "tweedie",
+    split_ids = val_resamples$id,
+    model_name = "lgbm_twd",
+    capture_last_fit = TRUE
+  )
+  # Extract the fitted model from the last fold
+  fitted_models$lgbm_twd <- lgbm_twd_val$last_fit
+  # Collect validation results
+  val_results$lgbm_twd <- lgbm_twd_val$metrics
+  val_predictions$lgbm_twd <- lgbm_twd_val$predictions
+  cat("Done LightGBM Tweedie.\n")
+} else {
+  cat(" Skipping LightGBM Tweedie\n")
+  tuned_lgbm_twd <- NULL
+  final_lgbm_twd <- NULL
+}
+
+# LightGBM L2 (log1p target)
+if ("lgbm_log" %in% models_to_run) {
+  cat(sprintf("Tuning LightGBM (L2) on log1p... (grid=%d, folds=%d)\n", nrow(grid_boosted), nrow(val_resamples)))
+  # Tuning with standard grid (no racing)
+  tuned_lgbm_log <- tune_grid(wf_lgbm_log, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
+  # Persist tuning metrics and report evaluated counts
+  met_lgbm_log <- collect_metrics(tuned_lgbm_log)
+  readr::write_csv(met_lgbm_log, sprintf("model_outputs/sst_tuning_metrics_lgbm_log__%s.csv", selection_metric))
+  cat(" Post-tuning check - unique configs evaluated:", length(unique(met_lgbm_log$.config)), "of", nrow(grid_boosted), "\n")
+  # Finalize workflow
+  final_lgbm_log <- finalize_workflow(wf_lgbm_log, select_best(tuned_lgbm_log, metric = selection_metric))
+  # Refit and collect validation metrics
+  cat("Re-fitting finalized model across validation folds for derived metrics...\n")
+  lgbm_log_val <- collect_fold_metrics(
+    final_lgbm_log,
+    val_resamples$splits,
+    backtransform = function(x) pmax(expm1(x), 0),
+    model_type = "log",
+    use_smearing = TRUE,
+    split_ids = val_resamples$id,
+    model_name = "lgbm_log",
+    capture_last_fit = TRUE
+  )
+  # Extract the fitted model from the last fold
+  fitted_models$lgbm_log <- lgbm_log_val$last_fit
+  # Collect validation results
+  val_results$lgbm_log <- lgbm_log_val$metrics
+  val_predictions$lgbm_log <- lgbm_log_val$predictions
+  cat(" Done LightGBM (L2) on log1p.\n")
+} else {
+  cat(" Skipping LightGBM (L2) on log1p\n")
+  tuned_lgbm_log <- NULL
+  final_lgbm_log <- NULL
+}
+
+# XGBoost Poisson
+if ("xgb_poi" %in% models_to_run) {
+  cat(sprintf("Tuning XGBoost Poisson... (grid=%d, folds=%d)\n", nrow(grid_boosted), nrow(val_resamples)))
+  # Tuning with standard grid (no racing)
+  tuned_xgb_poi <- tune_grid(wf_xgb_poi, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
+  # Persist tuning metrics and report evaluated counts
+  met_xgb_poi <- collect_metrics(tuned_xgb_poi)
+  readr::write_csv(met_xgb_poi, sprintf("model_outputs/sst_tuning_metrics_xgb_poi__%s.csv", selection_metric))
+  cat(" Post-tuning check - unique configs evaluated:", length(unique(met_xgb_poi$.config)), "of", nrow(grid_boosted), "\n")
+  # Finalize workflow
+  final_xgb_poi <- finalize_workflow(wf_xgb_poi, select_best(tuned_xgb_poi, metric = selection_metric))
+  # Refit and collect validation metrics
+  cat("Re-fitting finalized model across validation folds for derived metrics...\n")
+  xgb_poi_val <- collect_fold_metrics(
+    final_xgb_poi,
+    val_resamples$splits,
+    backtransform = identity,
+    model_type = "poisson",
+    split_ids = val_resamples$id,
+    model_name = "xgb_poi",
+    capture_last_fit = TRUE
+  )
+  # Extract the fitted model from the last fold
+  fitted_models$xgb_poi <- xgb_poi_val$last_fit
+  # Collect validation results
+  val_results$xgb_poi <- xgb_poi_val$metrics
+  val_predictions$xgb_poi <- xgb_poi_val$predictions
+  cat("Done XGBoost Poisson.\n")
+} else {
+  cat("Skipping XGBoost Poisson\n")
+  tuned_xgb_poi <- NULL
+  final_xgb_poi <- NULL
+}
+
+# XGBoost L2 (log1p target)
+if ("xgb_log" %in% models_to_run) {
+  cat(sprintf("Tuning XGBoost (L2) on log1p... (grid=%d, folds=%d)\n", nrow(grid_boosted), nrow(val_resamples)))
+  # Tuning with standard grid (no racing)
+  tuned_xgb_log <- tune_grid(wf_xgb_log, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
+  # Persist tuning metrics and report evaluated counts
+  met_xgb_log <- collect_metrics(tuned_xgb_log)
+  readr::write_csv(met_xgb_log, sprintf("model_outputs/sst_tuning_metrics_xgb_log__%s.csv", selection_metric))
+  cat(" Post-tuning check - unique configs evaluated:", length(unique(met_xgb_log$.config)), "of", nrow(grid_boosted), "\n")
+  # Finalize workflow
+  final_xgb_log <- finalize_workflow(wf_xgb_log, select_best(tuned_xgb_log, metric = selection_metric))
+  # Refit and collect validation metrics
+  cat("Re-fitting finalized model across validation folds for derived metrics...\n")
+  xgb_log_val <- collect_fold_metrics(
+    final_xgb_log,
+    val_resamples$splits,
+    backtransform = function(x) pmax(expm1(x), 0),
+    model_type = "log",
+    use_smearing = TRUE,
+    split_ids = val_resamples$id,
+    model_name = "xgb_log",
+    capture_last_fit = TRUE
+  )
+  # Extract the fitted model from the last fold
+  fitted_models$xgb_log <- xgb_log_val$last_fit
+  # Collect validation results
+  val_results$xgb_log <- xgb_log_val$metrics
+  val_predictions$xgb_log <- xgb_log_val$predictions
+  cat("Done XGBoost (L2) on log1p.\n")
+} else {
+  cat("Skipping XGBoost (L2) on log1p\n")
+  tuned_xgb_log <- NULL
+  final_xgb_log <- NULL
+}
+
+# Summarize validation results
+if (length(val_results) > 0) {
+  val_results <- val_results |>
+    dplyr::bind_rows(.id = "model")
+
+  # Already pooled per compute_metrics_from_preds; just arrange
+  val_summary <- val_results |>
+    dplyr::arrange(.data[[selection_metric]])
+
+  cat(sprintf("Validation summary (ranked by %s):\n", toupper(selection_metric))); print(val_summary)
+} else {
+  cat("No models were run. Check models_to_run list.\n")
+  val_summary <- data.frame(model = character(0), mae = numeric(0), rmse = numeric(0), rsq = numeric(0))
+}
+
+# Save validation results for later analysis (metric-aware filenames)
+readr::write_csv(val_results, sprintf("model_outputs/sst_val_results_detailed_%s.csv", selection_metric))
+readr::write_csv(val_summary, sprintf("model_outputs/sst_val_summary_%s.csv", selection_metric))
+
+# Save all fitted models for later analysis
+saveRDS(fitted_models, sprintf("model_outputs/sst_all_fitted_models_%s.rds", selection_metric))
+
+# record end time and print elapsed time
+end_time <- Sys.time()
+elapsed <- end_time - start_time
+cat("Time elapsed:", elapsed, "\n")
+
+# Restore warning option
+options(warn = old_warn)         
+```
+
+## Validation: Zero vs Non-Zero Metrics
+
+```{r}
+#| label: validation-separate-metrics
+
+if (length(val_predictions) > 0) {
+  cat("\n[Validation] Computing zero/non-zero and supplementary metrics from saved predictions...\n")
+  
+  val_separate_metrics <- map_dfr(names(val_predictions), function(model_name) {
+    preds_df <- val_predictions[[model_name]]
+    model_type <- unique(preds_df$model_type)[1]
+    
+    # Separate by zero/non-zero (pooled on concatenated predictions)
+    zero_mask <- preds_df$truth == 0
+    nonzero_mask <- preds_df$truth > 0
+    
+    basic_metrics <- bind_rows(
+      tibble(
+        model = model_name,
+        week_type = "zero",
+        .metric = c("mae", "rmse"),
+        .estimate = c(
+          yardstick::mae_vec(preds_df$truth[zero_mask], preds_df$.pred[zero_mask]),
+          yardstick::rmse_vec(preds_df$truth[zero_mask], preds_df$.pred[zero_mask])
+        )
+      ),
+      tibble(
+        model = model_name,
+        week_type = "non_zero",
+        .metric = c("mae", "rmse", "rsq"),
+        .estimate = c(
+          yardstick::mae_vec(preds_df$truth[nonzero_mask], preds_df$.pred[nonzero_mask]),
+          yardstick::rmse_vec(preds_df$truth[nonzero_mask], preds_df$.pred[nonzero_mask]),
+          yardstick::rsq_vec(preds_df$truth[nonzero_mask], preds_df$.pred[nonzero_mask])
+        )
+      )
+    )
+    
+    # Add supplementary metrics (overall, not by zero/non-zero)
+    supp_metrics <- tibble()
+    if (model_type %in% c("poisson", "tweedie")) {
+      pseudo_r2 <- compute_pseudo_r2(preds_df$truth, preds_df$.pred, family = model_type)
+      supp_metrics <- bind_rows(supp_metrics,
+        tibble(model = model_name, week_type = "overall", .metric = "pseudo_r2", .estimate = pseudo_r2)
+      )
+    }
+    if (model_type == "log" && ".pred_raw" %in% names(preds_df)) {
+      r2_log <- yardstick::rsq_vec(log1p(preds_df$truth), preds_df$.pred_raw)
+      supp_metrics <- bind_rows(supp_metrics,
+        tibble(model = model_name, week_type = "overall", .metric = "r2_log_scale", .estimate = r2_log)
+      )
+    }
+    
+    bind_rows(basic_metrics, supp_metrics)
+  })
+  
+  cat("\n[Validation] Zero/Non-zero and supplementary metrics by model:\n")
+  print(val_separate_metrics, n = 24)
+  
+  readr::write_csv(val_separate_metrics, sprintf("model_outputs/sst_val_separate_metrics_%s.csv", selection_metric))
+} else {
+  cat("\n[Validation] No predictions saved.")
+}
+```
+
+## Final fit on pretest and test evaluation
+
+```{r}
+#| label: final-test
+
+best_model <- val_summary$model[1]
+cat(" Best single-stage model:", best_model, "\n")
+
+final_wf <- switch(best_model,
+  lm_log = final_lm_log,
+  lgbm_poi = final_lgbm_poi,
+  xgb_poi = final_xgb_poi,
+  lgbm_log = final_lgbm_log,
+  xgb_log = final_xgb_log,
+  lgbm_twd = final_lgbm_twd,
+  glmnet_log = final_glmnet_log
+)
+
+final_fit <- fit(final_wf, data = pretest_df)
+test_pred <- predict(final_fit, new_data = test_df)$.pred
+
+# Back-transform for log1p models
+if (best_model %in% c("lm_log", "lgbm_log", "xgb_log", "glmnet_log")) {
+  # Apply smearing correction on test
+  test_pred_log <- predict(final_fit, new_data = test_df)$.pred
+  train_pred_log <- predict(final_fit, new_data = pretest_df)$.pred
+  log_resids <- log1p(pretest_df$strike_count) - train_pred_log
+  smear_factor <- compute_smearing_factor(log_resids)
+  test_pred <- pmax(smearing_backtransform(test_pred_log, smear_factor) - 1, 0)
+}
+
+# Optional: cap using training (pretest) response distribution to avoid leakage
+if (isTRUE(cap_predictions)) {
+  cap_val <- stats::quantile(pretest_df$strike_count, cap_quantile, na.rm = TRUE)
+  test_pred <- pmin(test_pred, cap_val)
+}
+
+# Enforce non-negativity and clean up
+test_pred <- pmax(test_pred, 0)
+test_pred[!is.finite(test_pred)] <- 0
+
+test_tbl <- metric_set(mae, rmse, rsq)(
+  bind_cols(truth = test_df$strike_count, .pred = test_pred),
+  truth = truth, estimate = .pred
+)
+
+# Add supplementary metrics based on model type
+supplementary_metrics <- tibble()
+
+if (best_model %in% c("lgbm_poi", "xgb_poi")) {
+  # Pseudo-R2 for Poisson models
+  pseudo_r2_val <- compute_pseudo_r2(test_df$strike_count, test_pred, family = "poisson")
+  supplementary_metrics <- bind_rows(supplementary_metrics,
+    tibble(.metric = "pseudo_r2_poisson", .estimator = "standard", .estimate = pseudo_r2_val))
+  cat(sprintf(" Pseudo-R² (Poisson deviance): %.4f\n", pseudo_r2_val))
+}
+
+if (best_model == "lgbm_twd") {
+  # Pseudo-R2 for Tweedie models
+  pseudo_r2_val <- compute_pseudo_r2(test_df$strike_count, test_pred, family = "tweedie")
+  supplementary_metrics <- bind_rows(supplementary_metrics,
+    tibble(.metric = "pseudo_r2_tweedie", .estimator = "standard", .estimate = pseudo_r2_val))
+  cat(sprintf(" Pseudo-R² (Tweedie deviance): %.4f\n", pseudo_r2_val))
+}
+
+if (best_model %in% c("lm_log", "lgbm_log", "xgb_log")) {
+  # For log models, report R2 on log scale
+  test_pred_log <- predict(final_fit, new_data = test_df)$.pred
+  r2_log <- rsq_vec(log1p(test_df$strike_count), test_pred_log)
+  supplementary_metrics <- bind_rows(supplementary_metrics,
+    tibble(.metric = "r2_log_scale", .estimator = "standard", .estimate = r2_log))
+  cat(sprintf(" R² on log scale: %.4f\n", r2_log))
+  cat(" Note: Primary metrics (MAE/RMSE/R²) are on original scale using naive expm1() back-transform\n")
+  cat(" To use smearing correction, set use_smearing=TRUE in validation section\n")
+}
+
+cat("\n Test metrics (original scale):\n"); print(test_tbl)
+
+# Save outputs for later analysis
+arrow::write_parquet(tibble(date = test_df$date, .pred = test_pred), sprintf("model_outputs/sst_predictions__%s.parquet", selection_metric))
+
+# Combine standard and supplementary metrics for saving
+all_test_metrics <- bind_rows(test_tbl, supplementary_metrics)
+readr::write_csv(all_test_metrics, sprintf("model_outputs/sst_metrics_%s.csv", selection_metric))
+
+# Save the fitted model for variable importance analysis
+saveRDS(final_fit, sprintf("model_outputs/sst_best_fitted_model_%s.rds", selection_metric))
+
+# Also save model metadata for reference
+model_metadata <- tibble(
+  best_model = best_model,
+  selection_metric = selection_metric,
+  validation_rmse = val_summary$rmse[1],
+  validation_mae = val_summary$mae[1],
+  validation_rsq = val_summary$rsq[1],
+  test_rmse = test_tbl$.estimate[test_tbl$.metric == "rmse"],
+  test_mae = test_tbl$.estimate[test_tbl$.metric == "mae"],
+  test_rsq = test_tbl$.estimate[test_tbl$.metric == "rsq"]
+)
+
+# Add supplementary metric to metadata if available
+if (nrow(supplementary_metrics) > 0) {
+  for (i in seq_len(nrow(supplementary_metrics))) {
+    metric_name <- paste0("test_", supplementary_metrics$.metric[i])
+    model_metadata[[metric_name]] <- supplementary_metrics$.estimate[i]
+  }
+}
+
+readr::write_csv(model_metadata, sprintf("model_outputs/sst_model_metadata_%s.csv", selection_metric))
+```
+
+## Test Set: Zero vs Non-Zero Metrics
+
+```{r}
+#| label: test-separate-metrics
+
+cat("\n[Test] Computing zero/non-zero metrics for best model:", best_model, "\n")
+
+# Use already-computed test predictions from final-test chunk
+zero_mask <- test_df$strike_count == 0
+nonzero_mask <- test_df$strike_count > 0
+
+test_separate_metrics <- bind_rows(
+  tibble(
+    model = best_model,
+    week_type = "zero",
+    .metric = c("mae", "rmse"),
+    .estimate = c(
+      yardstick::mae_vec(test_df$strike_count[zero_mask], test_pred[zero_mask]),
+      yardstick::rmse_vec(test_df$strike_count[zero_mask], test_pred[zero_mask])
+    )
+  ),
+  tibble(
+    model = best_model,
+    week_type = "non_zero",
+    .metric = c("mae", "rmse", "rsq"),
+    .estimate = c(
+      yardstick::mae_vec(test_df$strike_count[nonzero_mask], test_pred[nonzero_mask]),
+      yardstick::rmse_vec(test_df$strike_count[nonzero_mask], test_pred[nonzero_mask]),
+      yardstick::rsq_vec(test_df$strike_count[nonzero_mask], test_pred[nonzero_mask])
+    )
+  )
+)
+
+cat("\n[Test] Zero/Non-zero metrics on held-out test set:\n")
+print(test_separate_metrics)
+
+readr::write_csv(test_separate_metrics, sprintf("model_outputs/sst_test_separate_metrics_%s.csv", selection_metric))
+```
+
+## Feature Importance For Best Model (if applicable)
+
+```{r}
+#| label: feature-importance
+
+# Extract native importance from tree-based models only
+if (best_model %in% c("lgbm_poi", "lgbm_log", "lgbm_twd", "xgb_poi", "xgb_log")) {
+  cat(" Extracting native feature importance from", best_model, "\n")
+  
+  importance_df <- vip::vi_model(final_fit) |>
+    arrange(desc(Importance)) |>
+    mutate(model = best_model)
+  
+  # Save importance scores
+  arrow::write_parquet(importance_df, sprintf("model_outputs/sst_feature_importance_%s.parquet", selection_metric))
+  
+  # Print top 10
+  cat("\n Top 10 most important features:\n")
+  print(head(importance_df, 10))
+  
+} else {
+  cat(" Best model is", best_model, "- native importance not available (linear model)\n")
+  cat(" Use permutation importance or coefficient analysis for linear models\n")
+}
+```
+
+## Naive Baseline Comparisons: Validation Set
+
+```{r}
+#| label: naive-baselines-validation
+
+cat("\n[Naive Baselines] Computing validation set baseline predictions...\n")
+
+# Helper to compute baseline predictions per fold
+compute_baseline_fold <- function(split, baseline_type) {
+  analysis_data <- rsample::analysis(split)
+  assessment_data <- rsample::assessment(split)
+  
+  if (baseline_type == "mean") {
+    pred <- rep(mean(analysis_data$strike_count, na.rm = TRUE), nrow(assessment_data))
+  } else if (baseline_type == "median") {
+    pred <- rep(median(analysis_data$strike_count, na.rm = TRUE), nrow(assessment_data))
+  } else if (baseline_type == "persistence") {
+    pred <- assessment_data$strike_count_lag1
+  } else if (baseline_type == "zero") {
+    pred <- rep(0, nrow(assessment_data))
+  } else if (baseline_type == "rolling_4wk") {
+    pred <- assessment_data$rolling_avg_4wk
+  } else if (baseline_type == "rolling_8wk") {
+    pred <- assessment_data$rolling_avg_8wk
+  }
+  
+  # Clean up predictions (cap at 0, handle NAs)
+  pred <- pmax(pred, 0, na.rm = TRUE)
+  pred[!is.finite(pred)] <- 0
+  
+  tibble(
+    truth = assessment_data$strike_count,
+    .pred = pred,
+    baseline_type = baseline_type
+  )
+}
+
+# Compute all baseline predictions across validation folds
+baseline_types <- c("mean", "median", "persistence", "zero", "rolling_4wk", "rolling_8wk")
+naive_val_predictions <- list()
+
+for (baseline in baseline_types) {
+  cat("[Baseline] Computing", baseline, "predictions across validation folds...\n")
+  
+  # Get predictions for all folds
+  fold_preds <- purrr::map_dfr(val_resamples$splits, ~ compute_baseline_fold(.x, baseline))
+  
+  # Compute pooled metrics (concatenated across all folds)
+  pooled_metrics <- tibble(
+    model = paste0("naive_", baseline),
+    mae = yardstick::mae_vec(fold_preds$truth, fold_preds$.pred),
+    rmse = yardstick::rmse_vec(fold_preds$truth, fold_preds$.pred),
+    rsq = yardstick::rsq_vec(fold_preds$truth, fold_preds$.pred)
+  )
+  
+  naive_val_predictions[[baseline]] <- pooled_metrics
+}
+
+# Combine all baseline results
+naive_val_summary <- bind_rows(naive_val_predictions) |>
+  arrange(rmse)  # Rank by RMSE by default
+
+cat("\n[Naive Baselines] Validation set results (ranked by RMSE):\n")
+print(naive_val_summary)
+
+# Save validation baseline results (metric-agnostic filename)
+readr::write_csv(naive_val_summary, "model_outputs/sst_naive_baselines_validation.csv")
+
+# Save validation baseline results only (comparison tables will be created later)
+cat("\n[Naive Baselines] Validation baselines saved. Comparison tables will be created during writeup.\n")
+```
+
+## Naive Baseline Comparisons: Test Set
+
+```{r}
+#| label: naive-baselines-test
+
+cat("\n[Naive Baselines] Computing test set baseline predictions...\n")
+
+# Compute baseline statistics from full pretest data
+train_mean <- mean(pretest_df$strike_count, na.rm = TRUE)
+train_median <- median(pretest_df$strike_count, na.rm = TRUE)
+
+# Test set baselines
+naive_test_results <- list()
+
+# 1. Mean baseline
+naive_test_results$mean <- tibble(
+  model = "naive_mean",
+  mae = yardstick::mae_vec(test_df$strike_count, rep(train_mean, nrow(test_df))),
+  rmse = yardstick::rmse_vec(test_df$strike_count, rep(train_mean, nrow(test_df))),
+  rsq = yardstick::rsq_vec(test_df$strike_count, rep(train_mean, nrow(test_df)))
+)
+
+# 2. Median baseline
+naive_test_results$median <- tibble(
+  model = "naive_median",
+  mae = yardstick::mae_vec(test_df$strike_count, rep(train_median, nrow(test_df))),
+  rmse = yardstick::rmse_vec(test_df$strike_count, rep(train_median, nrow(test_df))),
+  rsq = yardstick::rsq_vec(test_df$strike_count, rep(train_median, nrow(test_df)))
+)
+
+# 3. Persistence (lag1)
+naive_test_results$persistence <- tibble(
+  model = "naive_persistence",
+  mae = yardstick::mae_vec(test_df$strike_count, test_df$strike_count_lag1),
+  rmse = yardstick::rmse_vec(test_df$strike_count, test_df$strike_count_lag1),
+  rsq = yardstick::rsq_vec(test_df$strike_count, test_df$strike_count_lag1)
+)
+
+# 4. Zero baseline
+naive_test_results$zero <- tibble(
+  model = "naive_zero",
+  mae = yardstick::mae_vec(test_df$strike_count, rep(0, nrow(test_df))),
+  rmse = yardstick::rmse_vec(test_df$strike_count, rep(0, nrow(test_df))),
+  rsq = NA_real_  # undefined for constant prediction
+)
+
+# 5. Rolling 4-week average
+naive_test_results$rolling_4wk <- tibble(
+  model = "naive_rolling_4wk",
+  mae = yardstick::mae_vec(test_df$strike_count, test_df$rolling_avg_4wk),
+  rmse = yardstick::rmse_vec(test_df$strike_count, test_df$rolling_avg_4wk),
+  rsq = yardstick::rsq_vec(test_df$strike_count, test_df$rolling_avg_4wk)
+)
+
+# 6. Rolling 8-week average
+naive_test_results$rolling_8wk <- tibble(
+  model = "naive_rolling_8wk",
+  mae = yardstick::mae_vec(test_df$strike_count, test_df$rolling_avg_8wk),
+  rmse = yardstick::rmse_vec(test_df$strike_count, test_df$rolling_avg_8wk),
+  rsq = yardstick::rsq_vec(test_df$strike_count, test_df$rolling_avg_8wk)
+)
+
+# Combine all test baseline results
+naive_test_summary <- bind_rows(naive_test_results) |>
+  arrange(rmse)  # Rank by RMSE by default
+
+cat("\n[Naive Baselines] Test set results (ranked by RMSE):\n")
+print(naive_test_summary)
+
+# Save test baseline results (metric-agnostic filename)
+readr::write_csv(naive_test_summary, "model_outputs/sst_naive_baselines_test.csv")
+
+# Save test baseline results only (comparison tables will be created later)
+cat("\n[Naive Baselines] Test baselines saved. Comparison tables will be created during writeup.\n")
+
+cat("\n[Naive Baselines] All baseline comparisons complete!\n")
+```
+
+

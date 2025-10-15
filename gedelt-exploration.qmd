@@ -1,0 +1,476 @@
+---
+title: "Untitled"
+format: html
+---
+
+```{r}
+#| label: setup
+
+library(sf)
+library(dplyr)
+library(dbplyr)
+library(lubridate)
+library(DBI)
+library(bigrquery)
+library(purrr)  
+library(arrow)
+```
+
+## Connect to GDELT via BigQuery
+
+```{r}
+bq_auth(path = "service-account.json")
+project_id <- "gdelt-449818"  
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = project_id,
+  billing = project_id
+)
+```
+
+
+
+```{r}
+library(bigrquery)
+
+sql <- "
+SELECT *
+FROM
+  `gdelt-bq.gdeltv2.events`
+WHERE
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101 AND
+  ActionGeo_Lat IS NOT NULL AND
+  ActionGeo_Long IS NOT NULL
+  AND RAND() < 1
+LIMIT 1000
+"
+
+# Run the dry run
+dry_job <- bq_perform_query(
+  project = project_id,
+  billing = project_id,
+  query = sql,
+  use_legacy_sql = FALSE,
+  dry_run = TRUE
+)
+
+job_meta <- bq_job_meta(dry_job)
+
+# Extract billed bytes from metadata
+bytes_billed <- as.numeric(job_meta$statistics$query$totalBytesBilled)
+
+# Print cost estimate
+cat("Estimated bytes processed:", bytes_billed, "\n")
+cat("Estimated cost (USD):", bytes_billed / 1e12 * 5, "\n")  # $5 per TB
+```
+
+This query for all of the columns will cost $1.82. Not too bad! 
+
+## Find the number of rows per year
+
+```{r}
+sql <- "
+SELECT
+  CAST(SUBSTR(CAST(SQLDATE AS STRING), 1, 4) AS INT64) AS year,
+  COUNT(*) AS n_events
+FROM
+  `gdelt-bq.gdeltv2.events`
+WHERE
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101 AND
+  ActionGeo_Lat IS NOT NULL AND
+  ActionGeo_Long IS NOT NULL
+GROUP BY year
+ORDER BY year
+"
+
+# Submit query
+job <- bq_project_query(project_id, sql)
+results <- bq_table_download(job)
+
+print(results)
+```
+
+```{r}
+mean(results$n_events)
+```
+
+I get between 32.7k and 62.8k rows per year and an average of 44292 rows. 
+
+## Explore Location Data Availability for Strike Events
+
+```{r}
+#| label: location-data-quality
+
+# Query to assess location data availability for strike events
+location_quality_query <- "
+SELECT 
+  -- Overall counts
+  COUNT(*) as total_strike_events,
+  COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) as events_with_location,
+  COUNT(CASE WHEN ActionGeo_Lat IS NULL OR ActionGeo_Long IS NULL THEN 1 END) as events_without_location,
+  
+  -- Calculate percentages
+  ROUND(COUNT(CASE WHEN ActionGeo_Lat IS NOT NULL AND ActionGeo_Long IS NOT NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_with_location,
+  ROUND(COUNT(CASE WHEN ActionGeo_Lat IS NULL OR ActionGeo_Long IS NULL THEN 1 END) / COUNT(*) * 100, 2) as pct_without_location
+FROM 
+  `gdelt-bq.gdeltv2.events`
+WHERE 
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101
+"
+
+# Execute query
+location_quality <- bq_project_query(project_id, location_quality_query) %>%
+  bq_table_download()
+
+print("Overall Location Data Quality for Strike Events (2015+):")
+kable(location_quality)
+```
+
+Upwards of 90% have location data. This is good! 
+
+## Download the data
+
+```{r}
+  sql <- paste0("
+  SELECT
+    GLOBALEVENTID,
+    SQLDATE,
+    ActionGeo_Lat,
+    ActionGeo_Long,
+    EventCode,
+    Actor1Name,
+    Actor1Code,
+    Actor2Name,
+    Actor2Code,
+    QuadClass,
+    GoldsteinScale
+  FROM
+    `gdelt-bq.gdeltv2.events`
+  WHERE
+    EventCode LIKE '143%' AND
+    SQLDATE >= ", 2015, "0101 AND
+    SQLDATE <= ", 2015, "1231 AND
+    ActionGeo_Lat IS NOT NULL AND
+    ActionGeo_Long IS NOT NULL
+  ")
+  
+  # Submit query and download
+  job <- bq_project_query(project_id, sql)
+  year_data <- bq_table_download(job)
+  
+  # Write to parquet
+  write_parquet(year_data, "data/raw/test2015.parquet") 
+```
+
+## Convert to sf and process
+
+```{r}
+strike_sf <- event_tbl %>%
+  mutate(
+    date = as.Date(as.character(SQLDATE), format = "%Y%m%d"),
+    week = floor_date(date, unit = "week", week_start = 1)
+  ) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+```
+
+## Load GADM Admin 1 boundaries (2015)
+
+```{r}
+#| label: gadm-load
+
+# What are the layer names?
+#st_layers("gadm-boundaries/gadm_410-levels.gpkg")
+
+# Import GADM Admin 1 boundaries
+adm1 <- read_sf("gadm-boundaries/gadm_410-levels.gpkg", layer = "ADM_1") |>
+  st_make_valid() |> # check for geometry validity 
+  select(GID_1, NAME_1, HASC_1, ISO_1, geom)
+```
+
+## Spatial Join: Events to ADM1
+
+```{r}
+strike_joined <- st_join(strike_sf, adm1, join = st_within, left = FALSE)
+```
+
+## Aggregate to ADM1-week level
+
+```{r}
+strike_counts <- strike_joined %>%
+  group_by(GID_1, NAME_1, NAME_0, week) %>%
+  summarize(
+    strike_events = n(),
+    .groups = "drop"
+  )
+
+# Preview result
+glimpse(strike_counts)
+```
+
+
+
+
+## Optimized Download Strategy: Year-by-year to Parquet
+
+```{r}
+#| label: download-yearly-data
+
+library(arrow)
+
+# Function to download one year of data
+download_year <- function(year, project_id, con) {
+  cat("Downloading data for year:", year, "\n")
+  
+  # Query for specific year
+  sql <- paste0("
+  SELECT
+    GLOBALEVENTID,
+    SQLDATE,
+    ActionGeo_Lat,
+    ActionGeo_Long,
+    EventCode,
+    Actor1Name,
+    Actor1Code,
+    Actor2Name,
+    Actor2Code,
+    QuadClass,
+    GoldsteinScale
+  FROM
+    `gdelt-bq.gdeltv2.events`
+  WHERE
+    EventCode LIKE '143%' AND
+    SQLDATE >= ", year, "0101 AND
+    SQLDATE <= ", year, "1231 AND
+    ActionGeo_Lat IS NOT NULL AND
+    ActionGeo_Long IS NOT NULL
+  ")
+  
+  # Submit query and download
+  job <- bq_project_query(project_id, sql)
+  year_data <- bq_table_download(job)
+  
+  # Write to parquet
+  write_parquet(year_data, paste0("data/raw/strikes_", year, ".parquet"))
+  
+  cat("Completed year:", year, "- Rows:", nrow(year_data), "\n")
+  return(nrow(year_data))
+}
+
+# Download all years (2015-2024)
+years <- 2015:2024
+row_counts <- map_int(years, ~download_year(.x, project_id, con))
+
+# Summary
+summary_df <- data.frame(year = years, rows = row_counts)
+print(summary_df)
+cat("Total rows:", sum(row_counts), "\n")
+```
+
+## Optimized Processing Strategy: Batch Process All Years
+
+```{r}
+#| label: optimized-processing
+
+library(arrow)
+library(sf)
+library(dplyr)
+library(lubridate)
+
+# 1. Load and prepare ADM1 boundaries (do this once)
+cat("Loading ADM1 boundaries...\n")
+adm1 <- read_sf("gadm-boundaries/gadm_410-levels.gpkg", layer = "ADM_1") %>%
+  st_make_valid() %>%
+  select(GID_1, NAME_1, HASC_1, ISO_1, NAME_0, geom) %>%
+  # Simplify geometries slightly for faster processing
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE)
+
+cat("ADM1 boundaries loaded:", nrow(adm1), "features\n")
+
+# 2. Load all strike data at once
+cat("Loading all strike data...\n")
+all_strikes <- map_dfr(2015:2024, function(year) {
+  read_parquet(paste0("data/raw/strikes_", year, ".parquet")) %>%
+    mutate(year = year)
+})
+
+cat("Total strike events loaded:", nrow(all_strikes), "\n")
+
+# 3. Convert to sf and add temporal variables (vectorized)
+cat("Converting to spatial data and adding time variables...\n")
+strikes_sf <- all_strikes %>%
+  mutate(
+    date = as.Date(as.character(SQLDATE), format = "%Y%m%d"),
+    week = floor_date(date, unit = "week", week_start = 1),
+    year_week = paste0(year(week), "-", sprintf("%02d", week(week)))
+  ) %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# 4. Spatial join (this is the expensive operation - do it once!)
+cat("Performing spatial join...\n")
+system.time({
+  strikes_joined <- st_join(strikes_sf, adm1, join = st_within, left = FALSE)
+})
+
+cat("Events successfully joined to ADM1:", nrow(strikes_joined), "\n")
+
+# 5. Aggregate to ADM1-week level
+cat("Aggregating to ADM1-week level...\n")
+strike_counts <- strikes_joined %>%
+  st_drop_geometry() %>%  # Remove geometry for faster grouping
+  group_by(GID_1, NAME_1, NAME_0, ISO_1, week, year_week) %>%
+  summarise(
+    strike_events = n(),
+    unique_actors1 = n_distinct(Actor1Name, na.rm = TRUE),
+    unique_actors2 = n_distinct(Actor2Name, na.rm = TRUE),
+    avg_goldstein = mean(GoldsteinScale, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(GID_1, week)
+
+# 6. Save results
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+write_parquet(strike_counts, "data/processed/adm1_weekly_strikes.parquet")
+write.csv(strike_counts, "data/processed/adm1_weekly_strikes.csv", row.names = FALSE)
+
+cat("Final aggregated dataset:\n")
+cat("- Rows:", nrow(strike_counts), "\n")
+cat("- Date range:", as.character(min(strike_counts$week)), "to", as.character(max(strike_counts$week)), "\n")
+cat("- Unique ADM1 units:", length(unique(strike_counts$GID_1)), "\n")
+
+glimpse(strike_counts)
+```
+
+## Alternative: Memory-efficient Yearly Processing
+
+```{r}
+#| label: memory-efficient-alternative
+#| eval: false
+
+# If you prefer to process year by year (useful for very large datasets)
+library(arrow)
+library(sf)
+library(dplyr)
+
+# Load ADM1 boundaries once
+adm1 <- read_sf("gadm-boundaries/gadm_410-levels.gpkg", layer = "ADM_1") %>%
+  st_make_valid() %>%
+  select(GID_1, NAME_1, HASC_1, ISO_1, NAME_0, geom) %>%
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE)
+
+# Process each year separately
+results_list <- list()
+
+for (year in 2015:2024) {
+  cat("Processing year:", year, "\n")
+  
+  # Load year data
+  year_data <- read_parquet(paste0("data/raw/strikes_", year, ".parquet"))
+  
+  # Convert to sf
+  year_sf <- year_data %>%
+    mutate(
+      date = as.Date(as.character(SQLDATE), format = "%Y%m%d"),
+      week = floor_date(date, unit = "week", week_start = 1),
+      year_week = paste0(year(week), "-", sprintf("%02d", week(week)))
+    ) %>%
+    st_as_sf(coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+  
+  # Spatial join
+  year_joined <- st_join(year_sf, adm1, join = st_within, left = FALSE)
+  
+  # Aggregate
+  year_counts <- year_joined %>%
+    st_drop_geometry() %>%
+    group_by(GID_1, NAME_1, NAME_0, ISO_1, week, year_week) %>%
+    summarise(
+      strike_events = n(),
+      unique_actors1 = n_distinct(Actor1Name, na.rm = TRUE),
+      unique_actors2 = n_distinct(Actor2Name, na.rm = TRUE),
+      avg_goldstein = mean(GoldsteinScale, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  results_list[[as.character(year)]] <- year_counts
+  
+  # Clean up memory
+  rm(year_data, year_sf, year_joined, year_counts)
+  gc()
+}
+
+# Combine all years
+final_results <- bind_rows(results_list)
+
+# Save
+write_parquet(final_results, "data/processed/adm1_weekly_strikes.parquet")
+```
+
+## Data Quality and Validation
+
+```{r}
+#| label: data-validation
+
+# Load final results
+strike_counts <- read_parquet("data/processed/adm1_weekly_strikes.parquet")
+
+# Basic validation
+cat("Data validation:\n")
+cat("- Total ADM1-week observations:", nrow(strike_counts), "\n")
+cat("- Unique ADM1 units:", length(unique(strike_counts$GID_1)), "\n")
+cat("- Date range:", as.character(min(strike_counts$week)), "to", as.character(max(strike_counts$week)), "\n")
+cat("- Years covered:", length(unique(year(strike_counts$week))), "\n")
+
+# Check for data gaps
+weekly_coverage <- strike_counts %>%
+  group_by(week) %>%
+  summarise(adm1_units = n_distinct(GID_1), .groups = "drop")
+
+# Plot coverage over time
+library(ggplot2)
+ggplot(weekly_coverage, aes(x = week, y = adm1_units)) +
+  geom_line() +
+  labs(title = "Number of ADM1 units with strike events per week",
+       x = "Week", y = "Number of ADM1 units") +
+  theme_minimal()
+
+# Sample of high-activity regions
+top_regions <- strike_counts %>%
+  group_by(GID_1, NAME_1, NAME_0) %>%
+  summarise(total_strikes = sum(strike_events), .groups = "drop") %>%
+  arrange(desc(total_strikes)) %>%
+  head(10)
+
+print("Top 10 regions by total strike events:")
+print(top_regions)
+```
+
+## Query GDELT for Strike Events using `dbplyr` 
+
+```{r}
+# Point to the BigQuery table
+gdelt_events <- tbl(con, from = I("gdelt-bq.gdeltv2.events"))
+
+# Filter and select using dplyr syntax
+event_tbl <- gdelt_events %>%
+  select(
+    GLOBALEVENTID,
+    SQLDATE,
+    lat = ActionGeo_Lat,
+    lon = ActionGeo_Long,
+    EventCode,
+    Actor1Name
+  ) %>%
+  filter(
+    EventCode %like% "143%",    
+    SQLDATE >= 20150101,
+    !is.na(ActionGeo_Lat),
+    !is.na(ActionGeo_Long)
+  ) %>%  
+  head(500000) %>%     # OPTIONAL: limit rows to prevent cost explosions
+  collect()
+
+# Preview the event data
+glimpse(event_tbl)
+```

@@ -1,0 +1,62 @@
+---
+title: "Data Quality Exploration""
+format: html
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidymodels)
+library(dplyr)
+library(lubridate)
+library(arrow)
+library(stringr)
+library(zoo)
+library(ggplot2)
+library(corrplot)
+library(gridExtra)
+library(vip)
+library(conflicted)
+
+# Set conflict preferences
+conflicts_prefer(dplyr::lag)
+
+# Set tidymodels preferences
+tidymodels_prefer()
+```
+
+## Load and Prepare Data
+
+```{r}
+#| label: load-data
+
+# Load the GDELT strikes data
+all_strikes_data <- read_parquet("data/raw/gdelt_strikes.parquet")
+
+# Check data structure
+glimpse(all_strikes_data)
+```
+
+## Event Code Exploration
+
+One interesting thing I am seeing is that the EventCode appears to be the same as the EventBaseCode, even where IsRootEvent is 0. This seems odd, as I would expect the EventCode to be more specific in these cases, e.g. 1431 for "Strike or boycott for leadership change" or 1432 for "Strike or boycott for policy change" as is outlined in the CAMEO codebook. 
+
+Let's see if any EventCodes are different from EventBaseCodes.
+
+```{r}
+#| label: event-code-exploration
+
+event_code_diff <- all_strikes_data %>%
+  filter(EventCode != EventBaseCode) %>%
+  select(EventCode, EventBaseCode, IsRootEvent) 
+
+glimpse(event_code_diff)
+```
+
+Interesting, there are only 967 rows out of 487287 where the EventCode is different from the EventBaseCode and all of these are coded 1431 (which presumably is srikes or boycots for leadership change). Also, in cases where EventCode is different from EventBaseCode, IsRootEvent is sometimes 0. So maybe IsRootEvent is being used differently than I expect, or maybe there is some error in the coding. 
+
+Oh now that I am looking it up, IsRootEvent actually means whether the event is main event being coded in the article (coded 1) or whether it is a secondary event (coded 0). So this makes sense now.
+

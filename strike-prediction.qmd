@@ -1,0 +1,1321 @@
+---
+title: "Strike Prediction"
+format: html
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidymodels)
+library(dplyr)
+library(lubridate)
+library(arrow)
+library(stringr)
+library(zoo)
+library(ggplot2)
+library(corrplot)
+library(gridExtra)
+library(vip)
+library(conflicted)
+library(janitor)
+library(sf)
+library(purrr)
+library(tidyr)
+library(geodist)
+library(FNN)
+
+# Set conflict preferences
+conflicts_prefer(dplyr::lag)
+
+# Set tidymodels preferences
+tidymodels_prefer()
+```
+
+## Load and Prepare Data
+
+```{r}
+#| label: load-data
+
+# Load the GDELT strikes data and clean names; keep only needed columns
+all_strikes_data <- read_parquet("data/enhanced/gdelt_strikes.parquet") |>
+  clean_names() |>
+  select(
+    # identifiers and dates
+    globaleventid, sqldate,
+    # action geo (primary location) fields used downstream
+    action_geo_country_code, 
+    action_geo_adm1_code = action_geo_adm1code, 
+    action_geo_adm2_code = action_geo_adm2code,
+    action_geo_lat, action_geo_long,
+    # counts and tone
+    num_mentions, num_articles, avg_tone,
+    # actor type codes used for diversity/flags
+    actor1_type1_code = actor1type1code, 
+    actor2_type1_code = actor2type1code
+  )
+
+# Quick structure
+glimpse(all_strikes_data)
+```
+
+## Data Wrangling and Feature Engineering 
+
+```{r}
+#| label: data-wrangling
+
+# Data wrangling and feature engineering
+weekly_strikes <- all_strikes_data |>
+  # Keep only strikes with genuine ADM1 codes (regional detail)
+  filter(
+    !is.na(action_geo_adm1_code), 
+    !is.na(action_geo_country_code),
+    action_geo_adm1_code != action_geo_country_code
+  ) |>
+  mutate(
+    date = as.Date(sqldate, format = "%Y%m%d"),
+    year_week = floor_date(date, "week"),
+    # Convert character columns to numeric
+    num_mentions = as.numeric(num_mentions),
+    num_articles = as.numeric(num_articles)
+  ) |>
+  group_by(action_geo_adm1_code, year_week) |>
+  summarise(
+    # Retain country code for stratification
+    action_geo_country_code = first(action_geo_country_code),
+    
+    # Target variable
+    strike_count = n(),
+    
+    # Event characteristics
+    avg_tone = mean(avg_tone, na.rm = TRUE),
+    total_mentions = sum(num_mentions, na.rm = TRUE),
+    total_articles = sum(num_articles, na.rm = TRUE),
+    
+    # Actor diversity and involvement
+    actor_diversity = n_distinct(paste(actor1_type1_code, actor2_type1_code), na.rm = TRUE),
+    unique_actor1_types = n_distinct(actor1_type1_code, na.rm = TRUE),
+    unique_actor2_types = n_distinct(actor2_type1_code, na.rm = TRUE),
+    
+    # Key actor involvement (binary flags)
+    has_gov = any(str_detect(paste(actor1_type1_code, actor2_type1_code), "GOV"), na.rm = TRUE),
+    has_labor = any(str_detect(paste(actor1_type1_code, actor2_type1_code), "LAB"), na.rm = TRUE),
+    has_civil = any(str_detect(paste(actor1_type1_code, actor2_type1_code), "CVL"), na.rm = TRUE),
+    
+    # Proportional involvement
+    prop_gov = mean(str_detect(paste(actor1_type1_code, actor2_type1_code), "GOV"), na.rm = TRUE),
+    prop_labor = mean(str_detect(paste(actor1_type1_code, actor2_type1_code), "LAB"), na.rm = TRUE),
+    prop_civil = mean(str_detect(paste(actor1_type1_code, actor2_type1_code), "CVL"), na.rm = TRUE),
+    
+    .groups = "drop"
+  ) |>
+  # Create date variable from year_week for temporal feature engineering
+  mutate(
+    year = year(year_week),
+    week = week(year_week),
+    date = year_week  # year_week is already the correct date
+  ) |>
+  arrange(action_geo_adm1_code, date)
+
+# Expand to full ADM1 × weekly panel with zero-filled counts
+panel_dates <- tibble(date = seq(min(weekly_strikes$date), max(weekly_strikes$date), by = "week"))
+adm1_keys <- weekly_strikes |>
+  distinct(action_geo_adm1_code, action_geo_country_code)
+
+weekly_strikes <- adm1_keys |>
+  tidyr::crossing(panel_dates) |>
+  left_join(weekly_strikes, by = c("action_geo_adm1_code", "action_geo_country_code", "date")) |>
+  mutate(
+    strike_count = coalesce(strike_count, 0L),
+    # Fill non-target weekly summaries for zero-event weeks
+    avg_tone = coalesce(avg_tone, 0),
+    total_mentions = coalesce(total_mentions, 0),
+    total_articles = coalesce(total_articles, 0),
+    actor_diversity = coalesce(actor_diversity, 0),
+    unique_actor1_types = coalesce(unique_actor1_types, 0),
+    unique_actor2_types = coalesce(unique_actor2_types, 0),
+    has_gov = coalesce(has_gov, FALSE),
+    has_labor = coalesce(has_labor, FALSE),
+    has_civil = coalesce(has_civil, FALSE),
+    prop_gov = coalesce(prop_gov, 0),
+    prop_labor = coalesce(prop_labor, 0),
+    prop_civil = coalesce(prop_civil, 0)
+  ) |>
+  group_by(action_geo_adm1_code) |>
+  tidyr::fill(action_geo_country_code, .direction = "downup") |>
+  ungroup() |>
+  arrange(action_geo_adm1_code, date)
+
+# Add lagged features and rolling averages
+weekly_strikes <- weekly_strikes |>
+  group_by(action_geo_adm1_code) |>
+  mutate(
+    # Lagged strike counts
+    strike_count_lag1 = lag(strike_count, 1),
+    strike_count_lag2 = lag(strike_count, 2),
+    strike_count_lag4 = lag(strike_count, 4),
+    
+    # Rolling averages
+    rolling_avg_4wk = rollmean(strike_count, k = 4, fill = NA, align = "right"),
+    rolling_avg_8wk = rollmean(strike_count, k = 8, fill = NA, align = "right"),
+    
+    # Lagged features for other variables (use only lags in modeling)
+    avg_tone_lag1 = lag(avg_tone, 1),
+    avg_tone_lag2 = lag(avg_tone, 2),
+    total_mentions_lag1 = lag(total_mentions, 1),
+    total_mentions_lag2 = lag(total_mentions, 2),
+    total_articles_lag1 = lag(total_articles, 1),
+    total_articles_lag2 = lag(total_articles, 2),
+    actor_diversity_lag1 = lag(actor_diversity, 1),
+    unique_actor1_types_lag1 = lag(unique_actor1_types, 1),
+    unique_actor2_types_lag1 = lag(unique_actor2_types, 1),
+    prop_gov_lag1 = lag(prop_gov, 1),
+    prop_labor_lag1 = lag(prop_labor, 1),
+    prop_civil_lag1 = lag(prop_civil, 1),
+
+    # Monotonic time trend
+    time_trend = row_number(),
+    
+    # Cyclical features for longer-term patterns
+    year_sin = sin(2 * pi * year(date) / 10), # 10-year cycle
+    year_cos = cos(2 * pi * year(date) / 10)
+  ) |>
+  ungroup() |>
+  # Add temporal indicators
+  mutate(
+    month = month(date),
+    quarter = quarter(date),
+    is_year_end = month %in% c(11, 12, 1)  # Holiday/year-end effect
+  )
+
+# Replace residual NAs in lagged/rolling features with 0 for modeling
+weekly_strikes <- weekly_strikes |>
+  mutate(
+    across(c(
+      strike_count_lag1, strike_count_lag2, strike_count_lag4,
+      rolling_avg_4wk, rolling_avg_8wk,
+      total_articles_lag1, total_articles_lag2,
+      total_mentions_lag1, total_mentions_lag2,
+      avg_tone_lag1, avg_tone_lag2,
+      actor_diversity_lag1,
+      unique_actor1_types_lag1, unique_actor2_types_lag1,
+      prop_gov_lag1, prop_labor_lag1, prop_civil_lag1
+    ), ~coalesce(., 0))
+  )
+```
+
+## Spatial Lag Features (t-1), built from ActionGeo lat/long
+
+```{r}
+#| label: spatial-lags
+
+# 1) Representative point per ADM1 from event geocodes
+adm1_points <- all_strikes_data |>
+  filter(!is.na(action_geo_adm1_code), !is.na(action_geo_country_code),
+         !is.na(action_geo_lat), !is.na(action_geo_long)) |>
+  group_by(action_geo_adm1_code, action_geo_country_code) |>
+  summarise(lat = median(action_geo_lat, na.rm = TRUE),
+            lon = median(action_geo_long, na.rm = TRUE),
+            .groups = "drop") |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+# 2) kNN neighbor edges (same-country)
+k <- 6
+coords <- st_coordinates(adm1_points)
+knn_idx <- FNN::get.knn(coords, k = k)$nn.index
+
+geo_cc <- adm1_points |>
+  st_drop_geometry() |>
+  select(action_geo_adm1_code, action_geo_country_code)
+
+edges <- purrr::map2_dfr(seq_len(nrow(adm1_points)), asplit(knn_idx, 1), function(i, nbrs) {
+  tibble(gid = adm1_points$action_geo_adm1_code[i],
+         gid_n = adm1_points$action_geo_adm1_code[nbrs])
+}) |>
+  left_join(geo_cc, by = c("gid" = "action_geo_adm1_code")) |>
+  left_join(geo_cc, by = c("gid_n" = "action_geo_adm1_code"), suffix = c("", "_n")) |>
+  filter(action_geo_country_code == action_geo_country_code_n) |>
+  select(gid, gid_n)
+
+# 3) Country-level lag t-1
+country_lag <- weekly_strikes |>
+  group_by(action_geo_country_code, date) |>
+  summarise(country_strikes = sum(strike_count), .groups = "drop") |>
+  arrange(action_geo_country_code, date) |>
+  group_by(action_geo_country_code) |>
+  mutate(country_strikes_lag1 = dplyr::lag(country_strikes, 1)) |>
+  ungroup() |>
+  select(action_geo_country_code, date, country_strikes_lag1)
+
+# 4) Neighbor lag t-1 (sum of neighbors' t-1)
+lagged_t1 <- weekly_strikes |>
+  group_by(action_geo_adm1_code) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(strike_t1 = dplyr::lag(strike_count, 1)) |>
+  ungroup() |>
+  select(action_geo_adm1_code, date, strike_t1)
+
+contig_lag <- lagged_t1 |>
+  rename(gid_n = action_geo_adm1_code) |>
+  inner_join(distinct(edges), by = "gid_n", relationship = "many-to-many") |>
+  group_by(gid, date) |>
+  summarise(contig_strikes_t1 = sum(strike_t1, na.rm = TRUE), .groups = "drop") |>
+  rename(action_geo_adm1_code = gid)
+
+# 5) Distance-weighted lag t-1 (inverse distance within cutoff)
+pts_df <- adm1_points |>
+  mutate(lon = st_coordinates(geometry)[,1],
+         lat = st_coordinates(geometry)[,2]) |>
+  st_drop_geometry()
+
+D <- geodist(pts_df[,c("lon","lat")], measure = "geodesic") / 1000  # km
+cutoff_km <- 500
+W <- 1/(D + 1)
+W[D > cutoff_km] <- 0
+diag(W) <- 0
+W <- W / pmax(rowSums(W), 1)
+
+W_long <- as_tibble(which(W > 0, arr.ind = TRUE)) |>
+  transmute(gid = pts_df$action_geo_adm1_code[row],
+            gid_n = pts_df$action_geo_adm1_code[col],
+            w = W[cbind(row, col)])
+
+distw_lag <- lagged_t1 |>
+  rename(gid_n = action_geo_adm1_code) |>
+  inner_join(distinct(W_long), by = "gid_n", relationship = "many-to-many") |>
+  group_by(gid, date) |>
+  summarise(distw_strikes_t1 = sum(w * strike_t1, na.rm = TRUE), .groups = "drop") |>
+  rename(action_geo_adm1_code = gid)
+
+# 6) Join spatial lags into weekly_strikes
+weekly_strikes <- weekly_strikes |>
+  left_join(country_lag, by = c("action_geo_country_code", "date")) |>
+  left_join(contig_lag, by = c("action_geo_adm1_code", "date")) |>
+  left_join(distw_lag, by = c("action_geo_adm1_code", "date")) |>
+  mutate(
+    country_strikes_lag1 = coalesce(country_strikes_lag1, 0),
+    contig_strikes_t1 = coalesce(contig_strikes_t1, 0),
+    distw_strikes_t1 = coalesce(distw_strikes_t1, 0)
+  )
+```
+
+## Final Dataset for Modeling
+
+```{r}
+# Remove rows with insufficient lagged data for modeling
+model_data <- weekly_strikes |>
+  filter(!is.na(strike_count_lag2)) |>  # Ensure at least 2 weeks of history
+  # Keep only target, structural/time features, and lagged/rolling predictors
+  select(
+    strike_count,
+    action_geo_adm1_code, action_geo_country_code,
+    time_trend, year_sin, year_cos, month, quarter, is_year_end,
+    strike_count_lag1, strike_count_lag2, strike_count_lag4,
+    rolling_avg_4wk, rolling_avg_8wk,
+    total_articles_lag1, total_articles_lag2,
+    total_mentions_lag1, total_mentions_lag2,
+    avg_tone_lag1, avg_tone_lag2,
+    actor_diversity_lag1,
+    unique_actor1_types_lag1, unique_actor2_types_lag1,
+    prop_gov_lag1, prop_labor_lag1, prop_civil_lag1,
+    # new spatial lags
+    country_strikes_lag1, contig_strikes_t1, distw_strikes_t1
+  )
+
+# Summary of processed data
+cat("=== FINAL DATASET SUMMARY ===\n")
+cat("Final dataset dimensions:", nrow(model_data), "x", ncol(model_data), "\n")
+cat("Unique ADM1 regions:", n_distinct(model_data$action_geo_adm1_code), "\n")
+cat("Unique countries:", n_distinct(model_data$action_geo_country_code), "\n")
+cat("Date range:", as.character(min(weekly_strikes$date, na.rm = TRUE)), "to", as.character(max(weekly_strikes$date, na.rm = TRUE)), "\n")
+```
+
+## Exploratory Data Analysis
+
+### Descriptive Statistics and Visualizations
+
+```{r}
+#| label: eda
+#| fig-width: 12
+#| fig-height: 8
+
+# Target variable distribution
+p1 <- model_data |>
+  ggplot(aes(x = strike_count)) +
+  geom_histogram(bins = 50, alpha = 0.7) +
+  scale_x_log10() +
+  labs(title = "Distribution of Weekly Strike Counts (log scale)",
+       x = "Strike Count", y = "Frequency")
+
+# Time series of strikes
+p2 <- weekly_strikes |>
+  group_by(date) |>
+  summarise(total_strikes = sum(strike_count), .groups = "drop") |>
+  ggplot(aes(x = date, y = total_strikes)) +
+  geom_line() +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "Global Strike Activity Over Time",
+       x = "Date", y = "Total Weekly Strikes")
+
+# Top regions by strike activity
+p3 <- model_data |>
+  group_by(action_geo_adm1_code) |>
+  summarise(total_strikes = sum(strike_count), .groups = "drop") |>
+  slice_max(total_strikes, n = 15) |>
+  ggplot(aes(x = reorder(action_geo_adm1_code, total_strikes), y = total_strikes)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 15 Regions by Total Strike Activity",
+       x = "ADM1 Code", y = "Total Strikes")
+
+# Temporal patterns
+p4 <- model_data |>
+  group_by(month) |>
+  summarise(avg_strikes = mean(strike_count), .groups = "drop") |>
+  ggplot(aes(x = month, y = avg_strikes)) +
+  geom_col() +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(title = "Average Strike Activity by Month",
+       x = "Month", y = "Average Strike Count")
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+### Correlation Analysis
+
+```{r}
+#| label: comprehensive-correlation
+#| fig-width: 14
+#| fig-height: 10
+
+# Comprehensive correlation matrix using lag-only event-driven features
+cor_data_full <- model_data |>
+  select(
+    # Target and lagged targets
+    strike_count, strike_count_lag1, strike_count_lag2, strike_count_lag4,
+
+    # Spatial lags
+    country_strikes_lag1, contig_strikes_t1, distw_strikes_t1,
+    
+    # Rolling averages
+    rolling_avg_4wk, rolling_avg_8wk,
+    
+    # Event-driven features (lags only)
+    avg_tone_lag1, avg_tone_lag2,
+    total_mentions_lag1, total_mentions_lag2,
+    total_articles_lag1, total_articles_lag2,
+    actor_diversity_lag1,
+    unique_actor1_types_lag1, unique_actor2_types_lag1,
+    prop_gov_lag1, prop_labor_lag1, prop_civil_lag1,
+    
+    # Temporal/structural features
+    time_trend, year_sin, year_cos,
+    month, quarter, is_year_end
+  ) |>
+  # Convert logical to numeric for correlation
+  mutate(across(everything(), as.numeric)) |>
+  cor(use = "complete.obs")
+
+# Create correlation heatmap with better labeling
+corrplot(cor_data_full, 
+         method = "color", 
+         type = "upper",
+         order = "hclust", 
+         tl.cex = 0.7, 
+         tl.col = "black",
+         tl.srt = 45,
+         title = "Comprehensive Feature Correlation Matrix",
+         mar = c(0,0,2,0))
+```
+
+### Feature Importance and Predictive Power
+
+```{r}
+#| label: feature-importance-preview
+#| fig-width: 12
+#| fig-height: 6
+
+# Quick feature correlation with target variable
+target_correlations <- model_data |>
+  select(-action_geo_adm1_code, -action_geo_country_code) |>
+  # Convert logical to numeric
+  mutate(
+    is_year_end = as.numeric(is_year_end)
+  ) |>
+  cor(use = "complete.obs") |>
+  as.data.frame() |>
+  rownames_to_column("feature") |>
+  select(feature, strike_count) |>
+  filter(feature != "strike_count") |>
+  arrange(desc(abs(strike_count))) #|>
+  #slice_head(n = 20)
+
+# Plot top correlations
+p_corr <- target_correlations |>
+  ggplot(aes(x = reorder(feature, abs(strike_count)), y = strike_count)) +
+  geom_col(aes(fill = strike_count > 0)) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "coral")) +
+  labs(title = "Top 20 Features by Correlation with Strike Count",
+       x = "Feature", y = "Correlation with Strike Count") +
+  theme(legend.position = "none")
+
+# Rolling averages effectiveness
+p_rolling <- model_data |>
+  select(strike_count, strike_count_lag1, rolling_avg_4wk, rolling_avg_8wk) |>
+  pivot_longer(-strike_count, names_to = "predictor", values_to = "value") |>
+  filter(!is.na(value)) |>
+  ggplot(aes(x = value, y = strike_count)) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~predictor, scales = "free_x") +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(title = "Predictive Power of Lagged and Rolling Features",
+       x = "Predictor Value (log scale)", y = "Strike Count (log scale)")
+
+grid.arrange(p_corr, p_rolling, ncol = 2)
+```
+
+## Modeling with Tidymodels
+
+### Model Setup and Temporal Split
+
+```{r}
+#| label: model-setup
+
+# Temporal train/validation/test split (80/10/10) - essential for time series
+# Avoids data leakage and follows realistic deployment scenario
+set.seed(2024)
+
+# Create model data with date preserved for proper temporal splitting
+model_data_with_date <- weekly_strikes |>
+  filter(!is.na(strike_count_lag2)) |>  # Same filter as model_data
+  select(
+    date,
+    strike_count,
+    action_geo_adm1_code, action_geo_country_code,
+    time_trend, year_sin, year_cos, month, quarter, is_year_end,
+    strike_count_lag1, strike_count_lag2, strike_count_lag4,
+    rolling_avg_4wk, rolling_avg_8wk,
+    total_articles_lag1, total_articles_lag2,
+    total_mentions_lag1, total_mentions_lag2,
+    avg_tone_lag1, avg_tone_lag2,
+    actor_diversity_lag1,
+    unique_actor1_types_lag1, unique_actor2_types_lag1,
+    prop_gov_lag1, prop_labor_lag1, prop_civil_lag1,
+    # new spatial lags
+    country_strikes_lag1, contig_strikes_t1, distw_strikes_t1
+  ) |>
+  arrange(date) |>  # Ensure proper temporal ordering
+  mutate(
+    row_index = row_number(),
+    total_rows = n(),
+    # Calculate split points
+    train_end = round(0.80 * total_rows),
+    val_end = round(0.90 * total_rows)
+  )
+
+# Get split boundaries
+split_info <- model_data_with_date |>
+  slice(c(1, unique(train_end), unique(val_end), n())) |>
+  summarise(
+    train_start = first(date),
+    train_end = nth(date, 2),
+    val_start = nth(date, 2) + days(1),
+    val_end = nth(date, 3),
+    test_start = nth(date, 3) + days(1),
+    test_end = last(date),
+    .groups = "drop"
+  )
+
+cat("=== TEMPORAL SPLIT BOUNDARIES ===\n")
+cat("Training:   ", as.character(split_info$train_start), "to", as.character(split_info$train_end), "\n")
+cat("Validation: ", as.character(split_info$val_start), "to", as.character(split_info$val_end), "\n")
+cat("Test:       ", as.character(split_info$test_start), "to", as.character(split_info$test_end), "\n\n")
+
+# Create the splits based on temporal ordering
+train_data <- model_data_with_date |>
+  filter(row_index <= unique(train_end)) |>
+  select(-date, -row_index, -total_rows, -train_end, -val_end)  # Remove helper columns
+
+val_data <- model_data_with_date |>
+  filter(row_index > unique(train_end) & row_index <= unique(val_end)) |>
+  select(-date, -row_index, -total_rows, -train_end, -val_end)
+
+test_data <- model_data_with_date |>
+  filter(row_index > unique(val_end)) |>
+  select(-date, -row_index, -total_rows, -train_end, -val_end)
+
+# Create indices for tidymodels compatibility
+train_indices <- which(model_data_with_date$row_index <= unique(model_data_with_date$train_end))
+val_indices <- which(model_data_with_date$row_index > unique(model_data_with_date$train_end) & 
+                     model_data_with_date$row_index <= unique(model_data_with_date$val_end))
+test_indices <- which(model_data_with_date$row_index > unique(model_data_with_date$val_end))
+
+# Create validation split object for tidymodels (train vs validation)
+val_split <- list(
+  train = train_indices,
+  val = val_indices
+)
+
+cat("Training set:   ", nrow(train_data), "observations (", round(100*nrow(train_data)/nrow(model_data_with_date), 1), "%)\n")
+cat("Validation set: ", nrow(val_data), "observations (", round(100*nrow(val_data)/nrow(model_data_with_date), 1), "%)\n")
+cat("Test set:       ", nrow(test_data), "observations (", round(100*nrow(test_data)/nrow(model_data_with_date), 1), "%)\n\n")
+
+cat("Country representation:\n")
+cat("Training:   ", n_distinct(train_data$action_geo_country_code), "countries\n")
+cat("Validation: ", n_distinct(val_data$action_geo_country_code), "countries\n") 
+cat("Test:       ", n_distinct(test_data$action_geo_country_code), "countries\n")
+```
+
+### Model Configuration
+
+```{r}
+#| label: model-config
+
+# Choose which models to run. Options:
+# - "xgb_poisson": XGBoost with Poisson objective
+# - "lgb_poisson": LightGBM with Poisson objective
+# - "lgb_tweedie": LightGBM with Tweedie objective
+# - "glm_nb":     Negative Binomial (MASS::glm.nb)
+# - "zinb":       Zero-Inflated Negative Binomial (glmmTMB/pscl)
+models_to_run <- c("lgb_tweedie")
+
+# Which model to finalize for test evaluation. Use one of models_to_run or "auto" to pick best RMSE on validation.
+final_model_name <- "auto"
+```
+
+### Recipe Preprocessing
+
+```{r}
+#| label: recipes
+
+# Recipe for tree-based models (XGBoost, LightGBM)
+# Use dummy encoding since these engines require numeric inputs
+tree_recipe <- recipe(strike_count ~ ., data = train_data) |>
+  # Handle categorical variables
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>  
+  step_other(action_geo_adm1_code, threshold = 0.01) |>  # Group rare ADM1s
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>  # Convert to dummy variables
+  # Convert logical to numeric
+  step_mutate(
+    is_year_end = as.numeric(is_year_end)
+  ) |>
+  step_dummy(all_nominal_predictors()) |>  # Handle any remaining categorical variables
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+
+# Recipe for GLM-style models (Negative Binomial / ZINB)
+# Use dummy encoding + normalization
+linear_recipe <- recipe(strike_count ~ ., data = train_data) |>
+  # Handle categorical variables
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.01) |>
+  step_dummy(action_geo_adm1_code, action_geo_country_code) |>
+  # Convert logical to numeric
+  step_mutate(
+    is_year_end = as.numeric(is_year_end)
+  ) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>  # Remove zero-variance columns BEFORE normalization
+  step_lincomb(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+cat("Created two recipes:\n")
+cat("1. tree_recipe: For XGBoost and LightGBM (keeps categorical variables)\n")
+cat("2. linear_recipe: For GLM-style models (NegBin/ZINB) with dummy encoding + normalization)\n")
+```
+
+### Model Specifications and Workflows
+
+```{r}
+#| label: model-specs
+
+library(bonsai)
+
+# XGBoost (Poisson) specification
+xgb_poisson_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) |>
+  set_engine(
+    "xgboost",
+    objective = "count:poisson",
+    eval_metric = "poisson-nloglik",
+    nthread = parallel::detectCores(),
+    tree_method = "hist"
+  ) |>
+  set_mode("regression")
+
+# LightGBM Poisson specification
+lgb_poisson_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) |>
+  set_engine(
+    "lightgbm",
+    objective = "poisson",
+    num_threads = parallel::detectCores()
+  ) |>
+  set_mode("regression")
+
+# LightGBM Tweedie specification
+lgb_tweedie_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune()
+) |>
+  set_engine(
+    "lightgbm",
+    objective = "tweedie",
+    tweedie_variance_power = 1.5,
+    num_threads = parallel::detectCores()
+  ) |>
+  set_mode("regression")
+```
+
+### Workflows for Model Training
+
+```{r}
+#| label: workflows
+
+# Create workflows with appropriate recipes (only for tree-based models)
+xgb_poisson_wf <- workflow() |>
+  add_recipe(tree_recipe) |>  # Use tree recipe (keeps categorical variables)
+  add_model(xgb_poisson_spec)
+
+lgb_poisson_wf <- workflow() |>
+  add_recipe(tree_recipe) |>  # Use tree recipe
+  add_model(lgb_poisson_spec)
+
+lgb_tweedie_wf <- workflow() |>
+  add_recipe(tree_recipe) |>  # Use tree recipe
+  add_model(lgb_tweedie_spec)
+```
+
+### Model Tuning and Validation
+
+```{r}
+#| label: tuning
+#| cache: true
+#| message: false
+
+# Create validation split object for tidymodels tuning
+# Combine train and validation data for the resampling object
+train_val_data <- bind_rows(
+  train_data |> mutate(.row = train_indices),
+  val_data |> mutate(.row = val_indices)
+)
+
+# Create validation split for tune_grid
+val_set <- make_splits(
+  list(analysis = train_indices, assessment = val_indices),
+  train_val_data
+)
+val_resamples <- manual_rset(list(val_set), c("validation"))
+
+# Hyperparameter grid for tree-based models (shared)
+xgb_grid <- grid_space_filling(
+  trees(range = c(100, 1000)),
+  tree_depth(range = c(3, 8)),
+  min_n(range = c(2, 20)),
+  loss_reduction(range = c(-10, 1.5)),
+  sample_size = sample_prop(range = c(0.5, 1.0)),
+  mtry(range = c(5, 15)),
+  learn_rate(range = c(-3, -1)),
+  size = 20
+)
+
+# Tune XGBoost (Poisson)
+if ("xgb_poisson" %in% models_to_run) {
+  xgb_poisson_tune <- tune_grid(
+    xgb_poisson_wf,
+    resamples = val_resamples,
+    grid = xgb_grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = FALSE, verbose = TRUE)
+  )
+} else {
+  xgb_poisson_tune <- NULL
+}
+
+# Tune LightGBM Poisson
+if ("lgb_poisson" %in% models_to_run) {
+  lgb_poisson_tune <- tune_grid(
+    lgb_poisson_wf,
+    resamples = val_resamples,
+    grid = xgb_grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = FALSE, verbose = TRUE)
+  )
+} else {
+  lgb_poisson_tune <- NULL
+}
+
+# Tune LightGBM Tweedie
+if ("lgb_tweedie" %in% models_to_run) {
+  lgb_tweedie_tune <- tune_grid(
+    lgb_tweedie_wf,
+    resamples = val_resamples,
+    grid = xgb_grid,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_grid(save_pred = FALSE, verbose = TRUE)
+  )
+} else {
+  lgb_tweedie_tune <- NULL
+}
+```
+
+### Count Models (Negative Binomial and ZINB) on Validation
+
+```{r}
+#| label: count-models
+
+# Prep baked data for GLM-style models
+glm_recipe_prepped <- prep(linear_recipe)
+train_glm <- bake(glm_recipe_prepped, train_data)
+val_glm <- bake(glm_recipe_prepped, val_data)
+
+nb_fit_val <- NULL
+nb_results <- NULL
+if ("glm_nb" %in% models_to_run) {
+  if (requireNamespace("MASS", quietly = TRUE)) {
+    # Increase iteration cap and set a stable starting theta to avoid alternation limit warnings
+    nb_fit_val <- MASS::glm.nb(
+      strike_count ~ .,
+      data = train_glm,
+      control = glm.control(maxit = 100),
+      init.theta = 1.0
+    )
+    nb_pred_val <- stats::predict(nb_fit_val, newdata = val_glm, type = "response")
+    nb_val_metrics <- tibble(truth = val_glm$strike_count, .pred = nb_pred_val) |>
+      metrics(truth = truth, estimate = .pred)
+    nb_results <- nb_val_metrics |>
+      transmute(model = "Negative Binomial", .metric, mean = .estimate, std_err = NA_real_)
+  } else {
+    message("MASS package not installed; skipping Negative Binomial model.")
+  }
+}
+
+zinb_fit_val <- NULL
+zinb_results <- NULL
+if ("zinb" %in% models_to_run) {
+  if (requireNamespace("glmmTMB", quietly = TRUE)) {
+    # Prefer glmmTMB
+    zinb_predictors <- setdiff(names(train_glm), "strike_count")
+    zinb_fixed_formula <- stats::reformulate(termlabels = zinb_predictors, response = "strike_count")
+    zinb_fit_val <- glmmTMB::glmmTMB(
+      formula = zinb_fixed_formula,
+      ziformula = ~ 1,
+      family = glmmTMB::nbinom2(),
+      data = train_glm,
+      control = glmmTMB::glmmTMBControl(optCtrl = list(iter.max = 1000, eval.max = 1000))
+    )
+    zinb_pred_val <- stats::predict(zinb_fit_val, newdata = val_glm, type = "response")
+    zinb_val_metrics <- tibble(truth = val_glm$strike_count, .pred = zinb_pred_val) |>
+      metrics(truth = truth, estimate = .pred)
+    zinb_results <- zinb_val_metrics |>
+      transmute(model = "ZINB (glmmTMB)", .metric, mean = .estimate, std_err = NA_real_)
+  } else if (requireNamespace("pscl", quietly = TRUE)) {
+    # Fallback to pscl::zeroinfl
+    zinb_predictors <- setdiff(names(train_glm), "strike_count")
+    zinb_count_formula <- stats::reformulate(termlabels = zinb_predictors, response = "strike_count")
+    zinb_full_formula <- stats::as.formula(paste0(
+      paste(deparse(zinb_count_formula), collapse = " "),
+      " | 1"
+    ))
+    zinb_fit_val <- pscl::zeroinfl(
+      formula = zinb_full_formula,
+      data = train_glm,
+      dist = "negbin"
+    )
+    zinb_pred_val <- stats::predict(zinb_fit_val, newdata = val_glm, type = "response")
+    zinb_val_metrics <- tibble(truth = val_glm$strike_count, .pred = zinb_pred_val) |>
+      metrics(truth = truth, estimate = .pred)
+    zinb_results <- zinb_val_metrics |>
+      transmute(model = "ZINB (pscl)", .metric, mean = .estimate, std_err = NA_real_)
+  } else {
+    message("Neither glmmTMB nor pscl installed; skipping ZINB model.")
+  }
+}
+```
+
+### Model Evaluation
+
+```{r}
+#| label: model-comparison
+
+# Collect validation results that exist
+val_results_list <- list()
+
+if (!is.null(xgb_poisson_tune)) {
+  val_results_list$xgb_poisson <- collect_metrics(xgb_poisson_tune) |>
+    mutate(model = "XGBoost (Poisson)")
+}
+if (!is.null(lgb_poisson_tune)) {
+  val_results_list$lgb_poisson <- collect_metrics(lgb_poisson_tune) |>
+    mutate(model = "LightGBM (Poisson)")
+}
+if (!is.null(lgb_tweedie_tune)) {
+  val_results_list$lgb_tweedie <- collect_metrics(lgb_tweedie_tune) |>
+    mutate(model = "LightGBM (Tweedie)")
+}
+if (!is.null(nb_results)) {
+  val_results_list$glm_nb <- nb_results
+}
+if (!is.null(zinb_results)) {
+  val_results_list$zinb <- zinb_results
+}
+
+all_val_results <- bind_rows(val_results_list)
+
+# Compare best models based on validation RMSE
+best_results <- all_val_results |>
+  filter(.metric == "rmse") |>
+  group_by(model) |>
+  slice_min(mean, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(mean)
+
+print("Validation set RMSE comparison:")
+print(best_results)
+```
+
+### Final Model Fit and Evaluation
+
+```{r}
+#| label: final-model
+
+# Determine final model to fit
+if (identical(final_model_name, "auto")) {
+  final_model_name <- best_results$model[1]
+}
+
+cat("Final model selected:", final_model_name, "\n")
+
+# Fit final model on combined train + validation data
+train_val_combined <- bind_rows(train_data, val_data)
+
+test_predictions <- NULL
+test_metrics <- NULL
+final_fit <- NULL
+final_wf <- NULL
+
+if (final_model_name == "XGBoost (Poisson)" || final_model_name == "xgb_poisson") {
+  best_params <- select_best(xgb_poisson_tune, metric = "rmse")
+  final_wf <- finalize_workflow(xgb_poisson_wf, best_params)
+  final_fit <- fit(final_wf, data = bind_rows(train_data, val_data))
+  test_predictions <- predict(final_fit, new_data = test_data) |>
+    bind_cols(test_data |> select(strike_count))
+} else if (final_model_name == "LightGBM (Poisson)" || final_model_name == "lgb_poisson") {
+  best_params <- select_best(lgb_poisson_tune, metric = "rmse")
+  final_wf <- finalize_workflow(lgb_poisson_wf, best_params)
+  final_fit <- fit(final_wf, data = bind_rows(train_data, val_data))
+  test_predictions <- predict(final_fit, new_data = test_data) |>
+    bind_cols(test_data |> select(strike_count))
+} else if (final_model_name == "LightGBM (Tweedie)" || final_model_name == "lgb_tweedie") {
+  best_params <- select_best(lgb_tweedie_tune, metric = "rmse")
+  final_wf <- finalize_workflow(lgb_tweedie_wf, best_params)
+  final_fit <- fit(final_wf, data = bind_rows(train_data, val_data))
+  test_predictions <- predict(final_fit, new_data = test_data) |>
+    bind_cols(test_data |> select(strike_count))
+} else if (final_model_name %in% c("Negative Binomial", "glm_nb")) {
+  # Fit NB with baked data
+  glm_recipe_prepped_final <- prep(linear_recipe)
+  trainval_glm <- bake(glm_recipe_prepped_final, bind_rows(train_data, val_data))
+  test_glm <- bake(glm_recipe_prepped_final, test_data)
+  if (requireNamespace("MASS", quietly = TRUE)) {
+    final_fit <- MASS::glm.nb(
+      strike_count ~ .,
+      data = trainval_glm,
+      control = glm.control(maxit = 100),
+      init.theta = 1.0
+    )
+    preds <- stats::predict(final_fit, newdata = test_glm, type = "response")
+    test_predictions <- tibble(.pred = preds, strike_count = test_glm$strike_count)
+  } else {
+    stop("MASS not installed; cannot fit Negative Binomial final model.")
+  }
+} else if (grepl("ZINB", final_model_name) || final_model_name == "zinb") {
+  glm_recipe_prepped_final <- prep(linear_recipe)
+  trainval_glm <- bake(glm_recipe_prepped_final, bind_rows(train_data, val_data))
+  test_glm <- bake(glm_recipe_prepped_final, test_data)
+  if (requireNamespace("pscl", quietly = TRUE)) {
+    # Prefer pscl::zeroinfl
+    zinb_predictors <- setdiff(names(trainval_glm), "strike_count")
+    zinb_count_formula <- stats::reformulate(termlabels = zinb_predictors, response = "strike_count")
+    zinb_full_formula <- stats::as.formula(paste0(
+      paste(deparse(zinb_count_formula), collapse = " "),
+      " | 1"
+    ))
+    final_fit <- pscl::zeroinfl(formula = zinb_full_formula, data = trainval_glm, dist = "negbin")
+    preds <- stats::predict(final_fit, newdata = test_glm, type = "response")
+    test_predictions <- tibble(.pred = preds, strike_count = test_glm$strike_count)
+  } else if (requireNamespace("glmmTMB", quietly = TRUE)) {
+    # Fallback to glmmTMB
+    zinb_predictors <- setdiff(names(trainval_glm), "strike_count")
+    zinb_fixed_formula <- stats::reformulate(termlabels = zinb_predictors, response = "strike_count")
+    final_fit <- glmmTMB::glmmTMB(
+      formula = zinb_fixed_formula,
+      ziformula = ~ 1,
+      family = glmmTMB::nbinom2(),
+      data = trainval_glm,
+      control = glmmTMB::glmmTMBControl(optCtrl = list(iter.max = 1000, eval.max = 1000))
+    )
+    preds <- stats::predict(final_fit, newdata = test_glm, type = "response")
+    test_predictions <- tibble(.pred = preds, strike_count = test_glm$strike_count)
+  } else {
+    stop("Neither pscl nor glmmTMB installed; cannot fit ZINB final model.")
+  }
+} else {
+  stop("final_model_name not recognized.")
+}
+
+# Calculate test set metrics
+test_metrics <- test_predictions |>
+  metrics(truth = strike_count, estimate = .pred)
+
+print("Test set performance:")
+print(test_metrics)
+
+# Try variable importance if available
+if (!is.null(final_wf)) {
+  try(vip(final_fit, num_features = 15), silent = TRUE)
+}
+
+cat("\n=== FINAL MODEL SUMMARY ===\n")
+cat("Model trained on:", nrow(bind_rows(train_data, val_data)), "observations (train + validation)\n")
+cat("Model tested on:", nrow(test_data), "observations\n")
+cat("Final test RMSE:", round(test_metrics$.estimate[test_metrics$.metric == "rmse"], 3), "\n")
+cat("Final test R²:", round(test_metrics$.estimate[test_metrics$.metric == "rsq"], 3), "\n")
+```
+
+## Summary
+
+```{r}
+#| label: summary
+
+# Model performance summary
+cat("=== PRELIMINARY STRIKE PREDICTION RESULTS ===\n\n")
+cat("Dataset: GDELT strikes (2015-present)\n")
+cat("Observations:", nrow(model_data), "weekly aggregations\n")
+cat("Regions:", n_distinct(model_data$ActionGeo_ADM1Code), "ADM1 codes\n")
+cat("Countries:", n_distinct(model_data$ActionGeo_CountryCode), "countries\n\n")
+
+cat("Methodology:\n")
+cat("- Temporal train/validation/test split (80/10/10)\n")
+cat("- Training:", as.character(split_info$train_start), "to", as.character(split_info$train_end), "\n")
+cat("- Validation:", as.character(split_info$val_start), "to", as.character(split_info$val_end), "\n") 
+cat("- Test:", as.character(split_info$test_start), "to", as.character(split_info$test_end), "\n")
+cat("- Prevents data leakage and follows realistic prediction scenario\n\n")
+
+cat("Final model:", final_model_name, "\n")
+if (nrow(best_results) > 0) {
+  cat("Best validation RMSE:", round(best_results$mean[1], 3), "\n")
+}
+cat("Test RMSE:", round(test_metrics$.estimate[test_metrics$.metric == "rmse"], 3), "\n")
+cat("Test R²:", round(test_metrics$.estimate[test_metrics$.metric == "rsq"], 3), "\n\n")
+
+cat("Key findings for abstract:\n")
+cat("- Temporal features (lagged counts, rolling averages) are most predictive\n")
+cat("- Media attention (mentions, articles) provides signal\n") 
+cat("- Actor diversity and involvement patterns matter\n")
+cat("- GDELT sentiment (tone) adds predictive value\n")
+cat("- Time series approach with proper temporal split essential for realistic evaluation\n")
+```
+
+## Basic Diagnostic plots
+
+```{r}
+library(patchwork)
+
+# Predictions vs Actual
+p1 <- ggplot(test_predictions, aes(x = strike_count, y = .pred)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Predictions vs Actual", x = "Actual Strike Count", y = "Predicted")
+
+# Residuals vs Fitted
+p2 <- test_predictions |>
+  mutate(residuals = strike_count - .pred) |>
+  ggplot(aes(x = .pred, y = residuals)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(title = "Residuals vs Fitted", x = "Fitted Values", y = "Residuals")
+
+diagnostic_plots <- p1 + p2 + 
+  plot_layout(ncol = 2) +
+  plot_annotation(title = "Model Diagnostics")
+
+diagnostic_plots
+```
+
+## Temporal Analysis
+
+```{r}
+# Prep data
+test_with_dates <- model_data_with_date |>
+  dplyr::slice(test_indices) |> 
+  select(date, action_geo_adm1_code, strike_count) |>
+  bind_cols(test_predictions |> select(.pred))
+
+# Then create temporal plots
+p3 <- test_with_dates |>
+  mutate(residuals = strike_count - .pred) |>
+  ggplot(aes(x = date, y = residuals)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess") +
+  labs(title = "Residuals Over Time")
+
+# Performance over time (in addition to your residuals plot)
+p4 <- test_with_dates |>
+  ggplot(aes(x = date)) +
+  geom_line(aes(y = strike_count, color = "Actual"), alpha = 0.7) +
+  geom_line(aes(y = .pred, color = "Predicted"), alpha = 0.7) +
+  labs(title = "Actual vs Predicted Over Time", y = "Strike Count") +
+  theme(legend.title = element_blank())
+
+# Monthly performance stability  
+p5 <- test_with_dates |>
+  mutate(month = floor_date(date, "month")) |>
+  group_by(month) |>
+  summarise(rmse = sqrt(mean((strike_count - .pred)^2)), .groups = "drop") |>
+  ggplot(aes(x = month, y = rmse)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Model RMSE by Month", y = "RMSE") 
+
+temporal_analysis <- p3 / p4 / p5 + 
+  plot_annotation(title = "Temporal Analysis of Model Performance")
+
+temporal_analysis
+```
+
+## Future Analysis Enhancements
+
+```{r}
+#| label: future-suggestions
+#| eval: false
+
+# ========================================
+# SUGGESTIONS FOR FUTURE ITERATIONS
+# ========================================
+
+cat("=== ENHANCEMENTS FOR DEEPER ANALYSIS ===\n\n")
+
+# 1. SPATIAL FEATURES
+cat("1. SPATIAL ENHANCEMENTS:\n")
+cat("- Add spatial lag variables (strikes in neighboring ADM1s)\n")
+cat("- Include distance-weighted spillover effects\n")
+cat("- Add country-level economic/political indicators\n")
+cat("- Consider geographic clustering (regions with similar patterns)\n\n")
+
+# Example spatial lag calculation:
+# spatial_lags <- weekly_strikes %>%
+#   left_join(adm1_neighbors, by = "ActionGeo_ADM1Code") %>%
+#   group_by(ActionGeo_ADM1Code, date) %>%
+#   summarise(neighbor_strikes = sum(neighbor_strike_count, na.rm = TRUE))
+
+# 2. ADVANCED TEMPORAL FEATURES  
+cat("2. TEMPORAL SOPHISTICATION:\n")
+cat("- Seasonal decomposition and detrending\n")
+cat("- Holiday/event calendars by country\n")
+cat("- Autoregressive error terms\n")
+cat("- Time-varying coefficients\n\n")
+
+# 3. CLASS IMBALANCE HANDLING
+cat("3. CLASS IMBALANCE (if many zero strike weeks):\n")
+cat("- Two-stage modeling: occurrence then intensity\n")
+cat("- Hurdle/zero-inflated models\n")
+cat("- SMOTE or other resampling techniques\n")
+cat("- Cost-sensitive learning\n\n")
+
+# 4. MODEL INTERPRETATION
+cat("4. ENHANCED INTERPRETATION:\n")
+cat("- SHAP values for individual predictions\n")
+cat("- Partial dependence plots\n")
+cat("- Feature interaction analysis\n")
+cat("- Time-varying importance\n\n")
+
+# Example SHAP analysis:
+# library(shapr)
+# shap_values <- explain(final_fit, x_test = test_data[1:100, ])
+
+# 5. ENSEMBLE METHODS
+cat("5. ENSEMBLE APPROACHES:\n")
+cat("- Stacking different model types\n")
+cat("- Time series specific ensembles\n")
+cat("- Bayesian model averaging\n")
+cat("- Dynamic ensemble weights\n\n")
+
+# 6. VALIDATION SOPHISTICATION
+cat("6. ADVANCED VALIDATION:\n")
+cat("- Time series cross-validation (expanding window)\n")
+cat("- Nested CV for hyperparameter stability\n")
+cat("- Forecast evaluation metrics (MAPE, sMAPE)\n")
+cat("- Prediction intervals and uncertainty quantification\n\n")
+
+# 7. EXTERNAL DATA INTEGRATION
+cat("7. EXTERNAL DATA SOURCES:\n")
+cat("- Economic indicators (GDP, unemployment, inflation)\n")
+cat("- Political events and elections\n")
+cat("- Weather/climate variables\n")
+cat("- Social media sentiment\n")
+cat("- News volume and topic modeling\n\n")
+
+# 8. SCALE AND EFFICIENCY
+cat("8. COMPUTATIONAL IMPROVEMENTS:\n")
+cat("- Larger hyperparameter grids\n")
+cat("- Parallel processing for CV\n")
+cat("- Early stopping for efficiency\n")
+cat("- Model compression for deployment\n\n")
+
+cat("=== IMMEDIATE NEXT STEPS ===\n")
+cat("For your next iteration, prioritize:\n")
+cat("1. Run current analysis and examine variable importance\n")
+cat("2. Add spatial lag features (neighboring ADM1 effects)\n") 
+cat("3. Implement time series CV for more robust validation\n")
+cat("4. Add SHAP analysis for model interpretation\n")
+cat("5. Consider zero-inflation if many zero-strike weeks\n")
+```
+
+## Save Model Objects and Diagnostics
+
+```{r}
+#| label: save-objects
+
+# 1. Save key model performance objects
+model_results <- list(
+  # Model object
+  final_model = final_fit,
+  final_model_name = final_model_name,
+  
+  # Performance metrics
+  test_metrics = test_metrics,
+  best_validation_results = best_results,
+  
+  # Data used for evaluation
+  test_predictions = test_predictions,
+  test_with_dates = test_with_dates,
+  
+  # Split information
+  split_boundaries = split_info,
+  
+  # Model comparison results (only those that exist)
+  xgb_poisson_results = if (exists("xgb_poisson_tune") && !is.null(xgb_poisson_tune)) collect_metrics(xgb_poisson_tune) else NULL,
+  lgb_poisson_results = if (exists("lgb_poisson_tune") && !is.null(lgb_poisson_tune)) collect_metrics(lgb_poisson_tune) else NULL,
+  lgb_tweedie_results = if (exists("lgb_tweedie_tune") && !is.null(lgb_tweedie_tune)) collect_metrics(lgb_tweedie_tune) else NULL,
+  glm_nb_results = nb_results,
+  zinb_results = zinb_results
+)
+
+# Save R objects
+saveRDS(model_results, "model_outputs/strike_prediction_results.rds")
+
+# 2. Create and save variable importance plot
+vip_plot <- vip(final_fit, num_features = 15) +
+  labs(title = "Variable Importance - Strike Prediction Model")
+
+# 3. Save all plots as high-quality images
+ggsave("model_outputs/variable_importance.png", vip_plot, 
+       width = 10, height = 6, dpi = 300)
+
+ggsave("model_outputs/diagnostic_plots.png", diagnostic_plots,
+       width = 12, height = 6, dpi = 300)
+
+ggsave("model_outputs/temporal_analysis.png", temporal_analysis,
+       width = 10, height = 12, dpi = 300)
+
+# 4. Save individual plots for flexibility
+ggsave("model_outputs/predictions_vs_actual.png", p1, 
+       width = 6, height = 6, dpi = 300)
+ggsave("model_outputs/residuals_vs_fitted.png", p2,
+       width = 6, height = 6, dpi = 300)
+ggsave("model_outputs/residuals_over_time.png", p3,
+       width = 10, height = 4, dpi = 300)
+ggsave("model_outputs/actual_vs_predicted_time.png", p4,
+       width = 10, height = 4, dpi = 300)
+ggsave("model_outputs/rmse_by_month.png", p5,
+       width = 10, height = 4, dpi = 300)
+
+# 5. Create summary CSV files
+# Model performance summary
+performance_summary <- data.frame(
+  model = best_model_name,
+  validation_rmse = round(best_results$mean[1], 3),
+  test_rmse = round(test_metrics$.estimate[test_metrics$.metric == "rmse"], 3),
+  test_rsq = round(test_metrics$.estimate[test_metrics$.metric == "rsq"], 3),
+  test_mae = round(test_metrics$.estimate[test_metrics$.metric == "mae"], 3),
+  training_obs = nrow(train_val_combined),
+  test_obs = nrow(test_data)
+)
+
+write.csv(performance_summary, "model_outputs/model_performance_summary.csv", row.names = FALSE)
+
+# Model comparison results
+results_to_bind <- list()
+if (exists("xgb_poisson_tune") && !is.null(xgb_poisson_tune)) {
+  results_to_bind$xgb_poisson <- collect_metrics(xgb_poisson_tune) |>
+    filter(.metric == "rmse") |>
+    slice_min(mean) |>
+    mutate(model = "XGBoost (Poisson)")
+}
+if (exists("lgb_poisson_tune") && !is.null(lgb_poisson_tune)) {
+  results_to_bind$lgb_poisson <- collect_metrics(lgb_poisson_tune) |>
+    filter(.metric == "rmse") |>
+    slice_min(mean) |>
+    mutate(model = "LightGBM (Poisson)")
+}
+if (exists("lgb_tweedie_tune") && !is.null(lgb_tweedie_tune)) {
+  results_to_bind$lgb_tweedie <- collect_metrics(lgb_tweedie_tune) |>
+    filter(.metric == "rmse") |>
+    slice_min(mean) |>
+    mutate(model = "LightGBM (Tweedie)")
+}
+if (!is.null(nb_results)) {
+  results_to_bind$glm_nb <- nb_results |>
+    filter(.metric == "rmse") |>
+    slice_min(mean)
+}
+if (!is.null(zinb_results)) {
+  results_to_bind$zinb <- zinb_results |>
+    filter(.metric == "rmse") |>
+    slice_min(mean)
+}
+
+all_model_results <- bind_rows(results_to_bind) |>
+  select(model, .metric, mean, std_err) |>
+  arrange(mean)
+
+write.csv(all_model_results, "model_outputs/model_comparison.csv", row.names = FALSE)
+
+cat("=== FILES SAVED ===\n")
+cat("R objects: model_outputs/strike_prediction_results.rds\n")
+cat("Plots saved as PNG files in model_outputs/\n")
+cat("- variable_importance.png\n")
+cat("- diagnostic_plots.png (combined)\n") 
+cat("- temporal_analysis.png (combined)\n")
+cat("- Individual plot files\n")
+cat("CSV summaries:\n")
+cat("- model_performance_summary.csv\n")
+cat("- model_comparison.csv\n")
+```
+

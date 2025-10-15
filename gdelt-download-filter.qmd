@@ -1,0 +1,562 @@
+---
+title: "GDELT Download"
+format: html
+---
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(lubridate)
+library(purrr) 
+library(sf)
+library(DBI)
+library(bigrquery) 
+library(arrow)
+```
+
+## Connect to GDELT via BigQuery
+
+```{r}
+bq_auth(path = "service-account.json")
+project_id <- "gdelt-449818"  
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = project_id,
+  billing = project_id
+)
+```
+
+## Download GDELT strikes data
+
+Run the SQL query to get all events with EventCode starting with '143' (which indicates strikes or boycotts) from 2015 onwards, and where latitude and longitude are available. Save the results as a parquet file for further analysis.
+
+```{r}
+#| label: download-gdelt-strikes
+
+# Create SQL query to fetch data
+sql <- "
+SELECT *
+FROM
+  `gdelt-bq.gdeltv2.events`
+WHERE
+  EventCode LIKE '143%' AND
+  SQLDATE >= 20150101 AND
+  ActionGeo_Lat IS NOT NULL AND
+  ActionGeo_Long IS NOT NULL
+"
+
+# Submit query and download
+job <- bq_project_query(project_id, sql)
+all_strikes_data <- bq_table_download(job, bigint = "character")
+
+# Save as a parquet file
+write_parquet(all_strikes_data, "data/raw/gdelt_strikes.parquet")
+```
+
+This gives us 492,500 rows of data. Next, let's filter the strikes data to keep only those with genuine ADM1 codes (regional detail) and save the filtered data as a parquet file.
+
+```{r}
+# load the raw strikes data
+all_strikes_data <- read_parquet("data/raw/gdelt_strikes.parquet")
+
+gdelt_strikes_filtered <- all_strikes_data |>
+  # Keep only strikes with genuine ADM1 codes (regional detail)
+  filter(
+    !is.na(ActionGeo_ADM1Code), 
+    !is.na(ActionGeo_CountryCode),
+    ActionGeo_ADM1Code != ActionGeo_CountryCode  # Filter out country-only codes
+  )
+
+glimpse(gdelt_strikes_filtered)
+
+# Save as a parquet file
+write_parquet(gdelt_strikes_filtered, "data/raw/gdelt_strikes_filtered.parquet")
+```
+
+This filtering step reduces the dataset to 328,982 rows. We can see from the URLs that there is a lot of irrelevant content, so we will take some steps to filter the data down to more relevant articles. Our first step will be to filter by Confidence score from the `eventmentions` table. The Confidence score is a measure of how relevant the article is to the event, specifically how many NLP steps had to be taken to extract the event info from a given article. The score ranges from 10 to 100 with higher scores indicating greater relevance. We will use a threshold of 80 to filter the data.
+
+## Filter Strikes by Confidence Score from EventMentions Table
+
+Let's start by creating a table of event ids from the strikes data and uploading it to BigQuery. This will allow us to join with the `eventmentions` table on these events so that we can filter by the Confidence score from that table.
+
+```{r}
+#| label: create-strike-ids-table
+
+# Load events parquet
+#gdelt_strikes_filtered <- read_parquet("data/raw/gdelt_strikes_filtered.parquet")
+
+# Keep only distinct GKGRECORDIDs
+strike_ids <- gdelt_strikes_filtered |>
+  distinct(GLOBALEVENTID) |>
+  filter(!is.na(GLOBALEVENTID))
+
+# Reference to the new table
+table_ref <- bq_table("gdelt-449818", "gdelt_analysis", "strike_events")
+
+# Upload
+bq_table_upload(
+  x = table_ref,
+  values = strike_ids,
+  create_disposition = "CREATE_IF_NEEDED",
+  write_disposition  = "WRITE_TRUNCATE",
+)
+```
+
+Now set up the query from the `eventmentions` table to grab the confidence scores for the strike events and filter to keep only those events with a confidence score of 80 or higher. 
+
+```{r}
+#| label: eventmentions-query
+
+sql_event_mentions <- "
+WITH high_conf AS (                        -- CTE table to get counts of high confidence mentions and unique sources per event
+  SELECT
+    m.GLOBALEVENTID, 
+    COUNTIF(m.Confidence >= 80) AS high_conf_mentions, 
+    COUNT(DISTINCT m.MentionSourceName) AS unique_sources
+  FROM `gdelt-bq.gdeltv2.eventmentions` m
+  JOIN `gdelt-449818.gdelt_analysis.strike_events` s      -- many to many join of eventmentions to our strike events
+    ON m.GLOBALEVENTID = s.GLOBALEVENTID
+  GROUP BY m.GLOBALEVENTID
+)
+
+SELECT
+  s.GLOBALEVENTID,
+  h.high_conf_mentions,
+  h.unique_sources
+FROM `gdelt-449818.gdelt_analysis.strike_events` s
+JOIN high_conf h                                   -- join back to CTE to filter high confidence events
+  ON s.GLOBALEVENTID = h.GLOBALEVENTID
+WHERE h.high_conf_mentions > 0                     -- keep only events with at least one high confidence mention 
+"
+```
+
+Do a dry run to estimate the size and cost of the query before actually running it.
+
+```{r}
+dry_job <- bq_project_query(
+  "gdelt-449818",
+  sql_event_mentions,
+  dry_run = TRUE
+)
+
+print(dry_job$total_bytes_processed / (1024^3))  # in GB
+```
+
+Now run the query and download the results and save as a parquet file.
+
+```{r}
+event_mentions_job <- bq_project_query("gdelt-449818", sql_event_mentions)
+gdelt_strikes_event_mentions <- bq_table_download(event_mentions_job, bigint = "character")
+
+glimpse(gdelt_strikes_event_mentions)
+
+write_parquet(gdelt_strikes_event_mentions, "data/raw/gdelt_strikes_event_mentions.parquet")
+```
+
+Now let's do an inner join to keep only those strikes events that have high confidence mentions.
+
+```{r}
+#| label: join-strikes-eventmentions
+
+# Load the filtered strikes data
+gdelt_strikes_filtered <- read_parquet("data/raw/gdelt_strikes_filtered.parquet")
+
+# Load the event mentions data
+gdelt_strikes_event_mentions <- read_parquet("data/raw/gdelt_strikes_event_mentions.parquet")
+
+# Inner join to keep only strikes with high confidence mentions
+gdelt_strikes_hiconf <- inner_join(
+    gdelt_strikes_filtered,
+    gdelt_strikes_event_mentions,
+    by = "GLOBALEVENTID"
+  )
+
+# Save as a parquet file
+write_parquet(gdelt_strikes_hiconf, "data/raw/gdelt_strikes_hiconf.parquet")
+
+glimpse(gdelt_strikes_hiconf)
+```
+
+OK that gets us down to 134,141 rows but you can tell from the URLs that there is still a lot of unrelated content in there. So next we will join with the GKG table to get themes to help us filter further. We can also use the GKG data to get tone information for the articles mentioning these events.
+
+## Merge Strikes Data with GKG Data via the `eventmentions` Table
+
+Merging our 134k+ strikes with GKG in one step is a very large, slow query that produces slot contention and high cardinality join warnings in BigQuery. So we need break it up into steps. We are going to create three smaller tables in BigQuery to help with this. 
+
+The first is a table of event ids from the high confidence strikes data that we just created so that we can query against only the strike events that we care about. 
+
+The second is a stored, filtered table of event mentions that only includes mentions of our high confidence strike events so that rather than joining the entire eventmentions table with GKG, we are only joining a smaller subset of eventmentions with GKG.  
+
+Third, we are going to materialize a filtered gkg table that only includes the articles that mention our high confidence strike events. Then we can query this smaller table to get themes and tone for our high confidence strike events and hopefully avoid some of the warngings we were seeing. 
+
+First let's create a table of event ids from the high confidence strikes data and upload it to BigQuery. This will allow us to join with the `gkg` table via the `eventmentions` table.
+
+```{r}
+#| label: anti-join-strikes-gkg
+
+library(bit64)  # for integer64 type
+
+# Load the hi confidence strikes data
+#gdelt_strikes_hiconf <- read_parquet("data/raw/gdelt_strikes_hiconf.parquet")
+
+# Keep only distinct GKGRECORDIDs
+strike_ids_hiconf <- gdelt_strikes_hiconf |>
+  distinct(GLOBALEVENTID) |>
+  filter(!is.na(GLOBALEVENTID)) |>
+  mutate(GLOBALEVENTID = as.integer64(GLOBALEVENTID)) # coerce to integer64 for BigQuery
+
+# Reference to the new table
+table_ref_hiconf <- bq_table("gdelt-449818", "gdelt_analysis", "strike_events_hiconf")
+
+# Upload
+bq_table_upload(
+  x = table_ref_hiconf,
+  values = strike_ids_hiconf,
+  create_disposition = "CREATE_IF_NEEDED",
+  write_disposition  = "WRITE_TRUNCATE",
+)
+```
+
+Next, let's create a stored, filtered table of event mentions that only includes mentions of our high confidence strike events so that rather than joining the entire eventmentions table with GKG, we are only joining a smaller subset of eventmentions with GKG. 
+
+```{r}
+#| label: create-strike-mentions-table
+
+# Query to extract strike-related mentions
+sql_strike_mentions <- "
+CREATE OR REPLACE TABLE `gdelt-449818.gdelt_analysis.strike_mentions` AS
+SELECT DISTINCT
+  m.MentionIdentifier,
+  m.GLOBALEVENTID
+FROM `gdelt-bq.gdeltv2.eventmentions` m
+JOIN `gdelt-449818.gdelt_analysis.strike_events_hiconf` s
+  ON m.GLOBALEVENTID = s.GLOBALEVENTID
+"
+
+# Run the query in BigQuery (this will create the table)
+job <- bq_project_query(
+  "gdelt-449818",   
+  sql_strike_mentions
+)
+
+# Reference the new table
+strike_mentions_tbl <- bq_table("gdelt-449818", "gdelt_analysis", "strike_mentions")
+
+# Quick peek
+head(bq_table_download(strike_mentions_tbl, n_max = 10))
+```
+
+Now let's create a stored, filtered table of GKG records that only includes the articles that mention our high confidence strike events. 
+
+**WARNING:** This query will scan about 20.5 TB of data, which is expensive. When I ran it cost approximately $128.
+
+```{r}
+#| label: create-strike-gkg-table
+
+sql_strike_gkg <- "
+CREATE OR REPLACE TABLE `gdelt-449818.gdelt_analysis.strike_gkg_docs` AS
+SELECT g.*
+FROM `gdelt-bq.gdeltv2.gkg` g
+JOIN `gdelt-449818.gdelt_analysis.strike_mentions` sm
+  ON g.DocumentIdentifier = sm.MentionIdentifier
+WHERE g.DATE >= 20150101
+"
+
+# Run the query in BigQuery (this will create the table)
+job <- bq_project_query(
+  "gdelt-449818",   
+  sql_strike_gkg
+)
+
+# Reference the new table
+strike_gkg_tbl <- bq_table("gdelt-449818", "gdelt_analysis", "strike_gkg_docs")
+
+# Quick peek
+head(bq_table_download(strike_gkg_tbl, n_max = 10))
+```
+
+Now set up the query to join the `eventmentions` table with the filtered `gkg` table we just created to get themes and tone for our high confidence strike events.
+
+```{r}
+#| label: gkg-query
+
+sql_event_gkg <- "
+-- Step 1: Tone aggregation
+CREATE OR REPLACE TABLE gdelt-449818.gdelt_analysis.strike_event_tone AS
+SELECT
+  m.GLOBALEVENTID,
+  AVG(CAST(SPLIT(g.V2Tone, ',')[OFFSET(0)] AS FLOAT64)) AS avg_tone,
+  AVG(CAST(SPLIT(g.V2Tone, ',')[OFFSET(1)] AS FLOAT64)) AS avg_pos_score,
+  AVG(CAST(SPLIT(g.V2Tone, ',')[OFFSET(2)] AS FLOAT64)) AS avg_neg_score,
+  AVG(CAST(SPLIT(g.V2Tone, ',')[OFFSET(3)] AS FLOAT64)) AS avg_polarity,
+  AVG(CAST(SPLIT(g.V2Tone, ',')[OFFSET(4)] AS FLOAT64)) AS avg_activity_ref_density,
+  AVG(CAST(SPLIT(g.V2Tone, ',')[OFFSET(5)] AS FLOAT64)) AS avg_self_group_density,
+  ARRAY_AGG(DISTINCT g.DocumentIdentifier IGNORE NULLS) AS article_urls
+FROM `gdelt-449818.gdelt_analysis.strike_mentions` m
+JOIN `gdelt-449818.gdelt_analysis.strike_gkg_docs` g
+  ON m.MentionIdentifier = g.DocumentIdentifier
+GROUP BY m.GLOBALEVENTID;
+
+-- Step 2: Theme aggregation
+CREATE OR REPLACE TABLE gdelt-449818.gdelt_analysis.strike_event_themes AS
+SELECT
+  m.GLOBALEVENTID,
+  STRING_AGG(DISTINCT TRIM(theme), ';') AS all_themes
+FROM `gdelt-449818.gdelt_analysis.strike_mentions` m
+JOIN `gdelt-449818.gdelt_analysis.strike_gkg_docs` g
+  ON m.MentionIdentifier = g.DocumentIdentifier
+CROSS JOIN UNNEST(SPLIT(g.V2Themes, ';')) AS theme
+GROUP BY m.GLOBALEVENTID;
+
+-- Step 3: Final join
+CREATE OR REPLACE TABLE gdelt-449818.gdelt_analysis.strike_event_gkg AS
+SELECT
+  t.*,
+  th.all_themes
+FROM gdelt-449818.gdelt_analysis.strike_event_tone t
+LEFT JOIN gdelt-449818.gdelt_analysis.strike_event_themes th
+  ON t.GLOBALEVENTID = th.GLOBALEVENTID;
+"
+```
+
+Do a dry run to estimate the size and cost of the query before actually running it.
+
+```{r}
+dry_job_gkg <- bq_project_query(
+  "gdelt-449818",
+  sql_event_gkg,
+  dry_run = TRUE
+)
+
+print(dry_job_gkg$total_bytes_processed / (1024^3))  # in GB
+```
+
+Now run the query and download the results and save as a parquet file.
+
+```{r}
+# | label: run-gkg-query
+
+# Run the query in BigQuery using the bq_perform_query function (because we are creating a table)
+event_gkg_job <- bq_perform_query(
+  project = "gdelt-449818", 
+  query = sql_event_gkg,
+  billing = "gdelt-449818"
+)
+bq_job_wait(event_gkg_job)
+```
+
+```{r}
+#| label: download-gkg-results
+
+# Reference the new table
+strike_event_gkg_tbl <- bq_table("gdelt-449818", "gdelt_analysis", "strike_event_gkg")
+
+# Download results
+bq_table_save(
+  strike_event_gkg_tbl,
+  destination_uris = "gs://gdelt-449818-strikes/strike_event_gkg-*.parquet",
+  billing = "gdelt-449818",
+  destination_format = "PARQUET"
+)
+
+# Before doing the following step, you have to copy the files locally using gsutil and the Google Cloud SDK:
+#  ~/google-cloud-sdk/bin/gsutil cp "gs://gdelt-449818-strikes/strike_event_gkg-*.parquet" data/raw/"
+# You have to do this from the command line, not from R. And you have to have the Google Cloud SDK installed.
+
+# Open the sharded dataset locally (NOT gs:// anymore)
+files <- c(
+  "data/raw/strike_event_gkg-000000000000.parquet", 
+  "data/raw/strike_event_gkg-000000000001.parquet"
+)
+ds <- open_dataset(files, format = "parquet")
+
+
+# Collect and write as a single local Parquet file
+strike_event_gkg <- ds %>% collect()
+write_parquet(strike_event_gkg, "data/raw/strike_event_gkg.parquet")
+
+# Reload the single file later
+gdelt_strikes_gkg <- read_parquet("data/raw/strike_event_gkg.parquet")
+
+glimpse(gdelt_strikes_gkg)
+```
+
+Now as a final step, let's join our filtered GKG data back to our high confidence strikes data to get a final dataset that includes all the strike event details along with the GKG themes and tone information. We will do a left join so that we keep all of our high confidence strike events so that we can use the entire set of those as the starting point for further analysis and filtering.
+
+```{r}
+#| label: final-join-strikes-gkg
+
+# Load strikes (events table with metadata)
+gdelt_strikes_hiconf <- read_parquet("data/raw/gdelt_strikes_hiconf.parquet")
+
+# Load enrichment (event-level GKG aggregation)
+gdelt_strikes_gkg <- read_parquet("data/raw/strike_event_gkg.parquet") |>
+  #change GLOBALEVENTID to character to match strikes data
+  mutate(GLOBALEVENTID = as.character(GLOBALEVENTID))
+
+# Merge: left join so we keep all strike events
+gdelt_strikes_enriched <- gdelt_strikes_hiconf |>
+  left_join(gdelt_strikes_gkg, by = "GLOBALEVENTID")
+
+# Save enriched dataset
+write_parquet(gdelt_strikes_enriched, "data/enhanced/gdelt_strikes_enriched.parquet")
+
+glimpse(gdelt_strikes_enriched)
+```
+
+## Filter by Themes
+
+```{r}
+# 1) Load your parquet
+gdelt_strikes_enriched <- read_parquet("data/enhanced/gdelt_strikes_enriched.parquet")
+
+# 2) Explode themes into long format, drop offsets
+themes_long <- gdelt_strikes_enriched |>
+  select(GLOBALEVENTID, all_themes) |>
+  filter(!is.na(all_themes)) |>
+  separate_rows(all_themes, sep = ";") |>
+  mutate(all_themes = str_trim(all_themes)) |>
+  filter(all_themes != "") |>
+  mutate(theme = sub(",.*$", "", all_themes)) |>
+  distinct(GLOBALEVENTID, theme) |>
+  select(GLOBALEVENTID, theme)
+
+# 3) Frequency table of unique themes
+theme_counts <- themes_long |>
+  count(theme, sort = TRUE)
+
+print(theme_counts, n = 100)
+```
+
+```{r}
+# 4) Candidate strike-related themes (first-pass via keywords)
+candidate_themes <- theme_counts |>
+  filter(str_detect(
+    theme,
+    regex("STRIKE|WALKOUT|LOCKOUT|PICKET|PROTEST|DEMONSTRAT|UNION|WORKER|EMPLOY(E|EE)|LABOU?R",
+          ignore_case = TRUE)
+  ))
+```
+
+```{r}
+# 5) Curated list (start with candidates, prune manually if needed)
+relevant_themes <- candidate_themes |> pull(theme)
+
+# 6) Filter events by relevant themes
+events_with_relevant <- themes_long |>
+  semi_join(tibble(theme = relevant_themes), by = "theme") |>
+  distinct(GLOBALEVENTID)
+
+gdelt_strikes_filtered <- gd |>
+  semi_join(events_with_relevant, by = "GLOBALEVENTID")
+```
+
+## Earlier Attempts
+
+```{r}
+sql_event_gkg <- "
+WITH gkg_exploded AS (
+  SELECT
+    m.GLOBALEVENTID,
+    g.GKGRECORDID,
+    g.DocumentIdentifier,
+    -- Split tone into parts
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(0)] AS FLOAT64) AS avg_tone,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(1)] AS FLOAT64) AS pos_score,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(2)] AS FLOAT64) AS neg_score,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(3)] AS FLOAT64) AS polarity,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(4)] AS FLOAT64) AS activity_ref_density,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(5)] AS FLOAT64) AS self_group_density,
+    g.V2Themes
+  FROM `gdelt-bq.gdeltv2.eventmentions` m
+  JOIN `gdelt-449818.gdelt_analysis.strike_events_hiconf` s
+    ON m.GLOBALEVENTID = s.GLOBALEVENTID
+  JOIN `gdelt-bq.gdeltv2.gkg` g
+    ON m.MentionIdentifier = g.DocumentIdentifier
+  WHERE g.DATE >= 20150101
+),
+
+-- Tokenize themes into one-per-row
+theme_tokens AS (
+  SELECT
+    GLOBALEVENTID,
+    TRIM(t) AS theme
+  FROM gkg_exploded
+  CROSS JOIN UNNEST(SPLIT(V2Themes, ';')) t
+)
+
+SELECT
+  e.GLOBALEVENTID,
+  -- Aggregate tone variables to event level
+  AVG(avg_tone) AS avg_tone,
+  AVG(pos_score) AS avg_pos_score,
+  AVG(neg_score) AS avg_neg_score,
+  AVG(polarity) AS avg_polarity,
+  AVG(activity_ref_density) AS avg_activity_ref_density,
+  AVG(self_group_density) AS avg_self_group_density,
+  -- Clean, deduplicated themes
+  STRING_AGG(DISTINCT theme, ';') AS all_themes,
+  -- Collect distinct article URLs into a list
+  ARRAY_AGG(DISTINCT DocumentIdentifier IGNORE NULLS) AS article_urls
+FROM gkg_exploded e
+LEFT JOIN theme_tokens t
+  ON e.GLOBALEVENTID = t.GLOBALEVENTID
+GROUP BY e.GLOBALEVENTID
+"
+```
+
+
+```{r}
+#| label: gkg-query
+
+sql_event_gkg <- "
+CREATE OR REPLACE TABLE `gdelt-449818.gdelt_analysis.strike_event_gkg` AS
+
+WITH gkg_exploded AS (
+  SELECT
+    m.GLOBALEVENTID,
+    g.GKGRECORDID,
+    g.DocumentIdentifier,
+    -- Split tone into parts (all as FLOAT64 for safety)
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(0)] AS FLOAT64) AS avg_tone,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(1)] AS FLOAT64) AS pos_score,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(2)] AS FLOAT64) AS neg_score,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(3)] AS FLOAT64) AS polarity,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(4)] AS FLOAT64) AS activity_ref_density,
+    CAST(SPLIT(g.V2Tone, ',')[OFFSET(5)] AS FLOAT64) AS self_group_density,
+    g.V2Themes
+  FROM `gdelt-449818.gdelt_analysis.strike_mentions` m
+  JOIN `gdelt-449818.gdelt_analysis.strike_gkg_docs` g
+    ON m.MentionIdentifier = g.DocumentIdentifier
+  WHERE g.DATE >= 20150101
+),
+
+-- Tokenize themes into one-per-row
+theme_tokens AS (
+  SELECT
+    GLOBALEVENTID,
+    TRIM(theme) AS theme
+  FROM gkg_exploded
+  CROSS JOIN UNNEST(SPLIT(V2Themes, ';')) AS theme
+)
+
+SELECT
+  e.GLOBALEVENTID,
+  -- Aggregate tone variables to event level
+  AVG(avg_tone) AS avg_tone,
+  AVG(pos_score) AS avg_pos_score,
+  AVG(neg_score) AS avg_neg_score,
+  AVG(polarity) AS avg_polarity,
+  AVG(activity_ref_density) AS avg_activity_ref_density,
+  AVG(self_group_density) AS avg_self_group_density,
+  -- Clean, deduplicated themes
+  STRING_AGG(DISTINCT theme, ';') AS all_themes,
+  -- Collect distinct article URLs into a list
+  ARRAY_AGG(DISTINCT DocumentIdentifier IGNORE NULLS) AS article_urls
+FROM gkg_exploded e
+LEFT JOIN theme_tokens t
+  ON e.GLOBALEVENTID = t.GLOBALEVENTID
+GROUP BY e.GLOBALEVENTID;
+"
+```

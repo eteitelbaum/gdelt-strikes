@@ -1,0 +1,936 @@
+---
+title: "Strike Prediction Model Visualizations"
+format: html
+---
+
+# Strike Prediction Model Visualizations
+
+This document generates publication-quality figures comparing single-stage vs two-stage (hurdle) models for predicting weekly strike counts at the ADM1 level.
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(ggplot2)
+library(arrow)
+library(patchwork)
+library(scales)
+library(lubridate)
+library(janitor)
+library(viridis)
+
+# Set publication-ready theme with viridis turbo
+theme_set(theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10),
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 11, face = "bold")
+  ))
+
+# Define color palette using viridis turbo
+# Single-stage: bright blue-green, Two-stage: bright purple, Baseline: bright yellow
+model_colors <- c(
+  "Single-stage" = viridis::turbo(10)[3],    # Bright blue-green
+  "Two-stage" = viridis::turbo(10)[8],       # Bright purple  
+  "Baseline" = viridis::turbo(10)[2],        # Bright yellow
+  "Best Single" = viridis::turbo(10)[3],
+  "Best Two" = viridis::turbo(10)[8],
+  "Best Baseline" = viridis::turbo(10)[2]
+)
+
+# Create plots directory
+dir.create("plots", showWarnings = FALSE)
+```
+
+## Load Data
+
+```{r}
+#| label: load-data
+
+# Single-stage validation results
+sst_val_summary <- read_csv("model_outputs/sst_val_summary_rmse.csv")
+sst_val_separate <- read_csv("model_outputs/sst_val_separate_metrics_rmse.csv")
+sst_test_separate <- read_csv("model_outputs/sst_test_separate_metrics_rmse.csv")
+
+# Single-stage test results
+sst_model_metadata <- read_csv("model_outputs/sst_model_metadata_rmse.csv")
+sst_predictions <- read_parquet("model_outputs/sst_predictions__rmse.parquet")
+
+# Two-stage validation results
+tsr_joint_opt <- read_csv("model_outputs/tsr_joint_optimization_results__rmse.csv")
+tsr_stage1_metrics <- read_csv("model_outputs/tsr_stage1_occurrence_metrics__rmse.csv")
+tsr_stage2_metrics <- read_csv("model_outputs/tsr_stage2_severity_metrics__rmse.csv")
+
+# Two-stage test results
+tsr_test_combined <- read_csv("model_outputs/two_stage_refined_test_combined__rmse.csv")
+tsr_test_occ <- read_csv("model_outputs/two_stage_refined_test_occ__rmse.csv")
+tsr_test_sev <- read_csv("model_outputs/two_stage_refined_test_sev__rmse.csv")
+tsr_test_predictions <- read_parquet("model_outputs/two_stage_refined_test_predictions__rmse.parquet")
+
+# Baseline comparisons
+sst_naive_val <- read_csv("model_outputs/sst_naive_baselines_validation.csv")
+sst_naive_test <- read_csv("model_outputs/sst_naive_baselines_test.csv")
+tsr_naive_combined <- read_csv("model_outputs/tsr_naive_combined_test.csv")
+
+# Calibration results
+tsr_calibration <- read_csv("model_outputs/tsr_stage1_calibration_results__rmse.csv")
+tsr_cal_curves <- read_csv("model_outputs/tsr_calibration_curves__rmse.csv")
+
+# RMSE vs MAE comparison
+sst_val_summary_mae <- read_csv("model_outputs/sst_val_summary_mae.csv")
+
+cat("Data loaded successfully.\n")
+cat("Single-stage models:", nrow(sst_val_summary), "\n")
+cat("Two-stage combinations:", nrow(tsr_joint_opt), "\n")
+```
+
+## Figure 1: Validation Performance - All Models
+
+```{r}
+#| label: fig1-validation-all-models
+
+# Prepare single-stage data (excluding LightGBM Poisson - outlier)
+sst_val_plot <- sst_val_summary |>
+  filter(model != "lgbm_poi") |>  # Exclude outlier model
+  mutate(
+    model_type = "Single-stage",
+    model_name = case_when(
+      model == "lm_log" ~ "LM log1p",
+      model == "glmnet_log" ~ "GLMNET log1p", 
+      model == "lgbm_log" ~ "LightGBM log1p",
+      model == "xgb_log" ~ "XGBoost log1p",
+      model == "xgb_poi" ~ "XGBoost Poisson",
+      model == "lgbm_twd" ~ "LightGBM Tweedie",
+      TRUE ~ model
+    ),
+    is_best = model == "lm_log"  # Best single-stage model
+  )
+
+# Prepare two-stage data (top 10 combinations)
+tsr_val_plot <- tsr_joint_opt |>
+  head(10) |>
+  mutate(
+    model_type = "Two-stage",
+    model_name = case_when(
+      classifier == "glm" & severity_model == "gamma_xgb" ~ "GLM + Gamma XGBoost",
+      classifier == "glm" & severity_model == "lgbm_log" ~ "GLM + LightGBM log1p",
+      classifier == "glm" & severity_model == "gamma_lgbm" ~ "GLM + Gamma LightGBM",
+      classifier == "glm" & severity_model == "xgb_log" ~ "GLM + XGBoost log1p",
+      classifier == "glm" & severity_model == "glmnet_log" ~ "GLM + GLMNET log1p",
+      classifier == "glm" & severity_model == "lm_log" ~ "GLM + LM log1p",
+      classifier == "lgbm" & severity_model == "lm_log" ~ "LightGBM + LM log1p",
+      classifier == "lgbm" & severity_model == "glmnet_log" ~ "LightGBM + GLMNET log1p",
+      classifier == "lgbm" & severity_model == "gamma_lgbm" ~ "LightGBM + Gamma LightGBM",
+      classifier == "lgbm" & severity_model == "gamma_xgb" ~ "LightGBM + Gamma XGBoost",
+      TRUE ~ paste(classifier, "+", severity_model)
+    ),
+    is_best = row_number() == 1  # Best two-stage combination
+  )
+
+# Prepare baseline data
+baseline_val <- sst_naive_val |>
+  filter(model == "naive_rolling_4wk") |>
+  mutate(
+    model_type = "Baseline",
+    model_name = "Rolling 4wk",
+    is_best = TRUE
+  )
+
+# Combine all validation data
+val_comparison <- bind_rows(
+  sst_val_plot |> select(model_name, model_type, rmse, mae, rsq, is_best),
+  tsr_val_plot |> select(model_name, model_type, rmse = combined_rmse, mae = combined_mae, rsq = combined_rsq, is_best),
+  baseline_val |> select(model_name, model_type, rmse, mae, rsq, is_best)
+) |>
+  mutate(
+    model_name = fct_reorder(model_name, -rmse),  # Sort from best (lowest RMSE) to worst
+    model_type = fct_relevel(model_type, "Single-stage", "Two-stage", "Baseline"),
+    selection_status = if_else(is_best, "Selected Model", "Not Selected")
+  )
+
+# Create dot plot for RMSE
+p1 <- ggplot(val_comparison, aes(x = rmse, y = model_name, color = model_type, size = selection_status)) +
+  geom_point() +
+  scale_color_manual(values = model_colors, name = "Model Type") +
+  scale_size_manual(values = c("Not Selected" = 2, "Selected Model" = 3), name = "Selection") +
+  guides(color = guide_legend(order = 1), size = guide_legend(order = 2)) +
+  labs(title = "RMSE") +
+  theme(legend.position = "right",
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        legend.spacing.y = unit(0.5, "cm"))
+
+# Create dot plot for MAE
+p2 <- ggplot(val_comparison, aes(x = mae, y = model_name, color = model_type, size = selection_status)) +
+  geom_point() +
+  scale_color_manual(values = model_colors, name = "Model Type") +
+  scale_size_manual(values = c("Not Selected" = 2, "Selected Model" = 3), name = "Selection") +
+  guides(color = guide_legend(order = 1), size = guide_legend(order = 2)) +
+  labs(title = "MAE") +
+  theme(legend.position = "right",
+        axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        legend.spacing.y = unit(0.5, "cm"))
+
+# Create dot plot for R²
+p3 <- ggplot(val_comparison, aes(x = rsq, y = model_name, color = model_type, size = selection_status)) +
+  geom_point() +
+  scale_color_manual(values = model_colors, name = "Model Type") +
+  scale_size_manual(values = c("Not Selected" = 2, "Selected Model" = 3), name = "Selection") +
+  guides(color = guide_legend(order = 1), size = guide_legend(order = 2)) +
+  scale_x_continuous(labels = percent_format()) +
+  labs(title = "R²") +
+  theme(legend.position = "right",
+        axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        legend.spacing.y = unit(0.5, "cm"))
+
+# Combine plots
+fig1 <- (p1 | p2 | p3) + plot_layout(guides = "collect") & theme(legend.position = "right")
+
+print(fig1)
+
+# Save figure
+ggsave("plots/fig1_validation_all_models.png", fig1, width = 15, height = 8, dpi = 300)
+ggsave("plots/fig1_validation_all_models.pdf", fig1, width = 15, height = 8)
+```
+
+## Figure 2: Test Performance - Best Models
+
+```{r}
+#| label: fig2-test-best-models
+
+# Prepare best models data
+best_models <- tibble(
+  model_name = c("Single-stage (LM log1p)", "Two-stage (GLM + Gamma XGB)", "Baseline (Rolling 4wk)"),
+  model_type = c("Single-stage", "Two-stage", "Baseline"),
+  val_rmse = c(sst_val_summary$rmse[sst_val_summary$model == "lm_log"], 
+               tsr_joint_opt$combined_rmse[1],
+               sst_naive_val$rmse[sst_naive_val$model == "naive_rolling_4wk"]),
+  test_rmse = c(sst_model_metadata$test_rmse[1],
+                tsr_test_combined$.estimate[tsr_test_combined$.metric == "rmse"],
+                sst_naive_test$rmse[sst_naive_test$model == "naive_rolling_4wk"]),
+  val_mae = c(sst_val_summary$mae[sst_val_summary$model == "lm_log"],
+              tsr_joint_opt$combined_mae[1], 
+              sst_naive_val$mae[sst_naive_val$model == "naive_rolling_4wk"]),
+  test_mae = c(sst_model_metadata$test_mae[1],
+               tsr_test_combined$.estimate[tsr_test_combined$.metric == "mae"],
+               sst_naive_test$mae[sst_naive_test$model == "naive_rolling_4wk"]),
+  val_rsq = c(sst_val_summary$rsq[sst_val_summary$model == "lm_log"],
+              tsr_joint_opt$combined_rsq[1],
+              sst_naive_val$rsq[sst_naive_val$model == "naive_rolling_4wk"]),
+  test_rsq = c(sst_model_metadata$test_rsq[1],
+               tsr_test_combined$.estimate[tsr_test_combined$.metric == "rsq"],
+               sst_naive_test$rsq[sst_naive_test$model == "naive_rolling_4wk"])
+) |>
+  pivot_longer(cols = starts_with(c("val_", "test_")), 
+               names_to = c("dataset", "metric"), 
+               names_sep = "_") |>
+  pivot_wider(names_from = metric, values_from = value) |>
+  mutate(
+    model_name = fct_relevel(model_name, "Single-stage (LM log1p)", "Two-stage (GLM + Gamma XGB)", "Baseline (Rolling 4wk)"),
+    dataset = fct_relevel(dataset, "val", "test")
+  )
+
+# Create grouped bar charts
+p_rmse <- ggplot(best_models, aes(x = model_name, y = rmse, fill = dataset)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("val" = viridis::turbo(10)[1], "test" = viridis::turbo(10)[9]), 
+                    labels = c("Validation", "Test")) +
+  labs(title = "RMSE", fill = "Dataset") +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+p_mae <- ggplot(best_models, aes(x = model_name, y = mae, fill = dataset)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("val" = viridis::turbo(10)[1], "test" = viridis::turbo(10)[9]),
+                    labels = c("Validation", "Test")) +
+  labs(title = "MAE", fill = "Dataset") +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+p_rsq <- ggplot(best_models, aes(x = model_name, y = rsq, fill = dataset)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("val" = viridis::turbo(10)[1], "test" = viridis::turbo(10)[9]),
+                    labels = c("Validation", "Test")) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "R²", fill = "Dataset") +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+fig2 <- (p_rmse | p_mae | p_rsq) + plot_layout(guides = "collect")
+
+print(fig2)
+
+# Save figure
+ggsave("plots/fig2_test_best_models.png", fig2, width = 15, height = 5, dpi = 300)
+ggsave("plots/fig2_test_best_models.pdf", fig2, width = 15, height = 5)
+```
+
+## Figure 3: Non-Zero Week Performance (Apples-to-Apples)
+
+```{r}
+#| label: fig3-nonzero-performance
+
+# Prepare aligned comparison data (same models on same rows)
+# Create a unified list of all unique model names across both approaches
+all_models <- c(
+  # Overlapping models (same in both)
+  "LM log1p", "GLMNET log1p", "LightGBM log1p", "XGBoost log1p",
+  # Single-stage only
+  "XGBoost Poisson", "LightGBM Tweedie",
+  # Two-stage only  
+  "Gamma LightGBM", "Gamma XGBoost"
+)
+
+# Prepare single-stage data (non-zero weeks only)
+sst_nonzero_plot <- sst_val_separate |>
+  filter(week_type == "non_zero", .metric == "rmse", model != "lgbm_poi") |>
+  select(model, rmse = .estimate) |>
+  mutate(
+    model_name = case_when(
+      model == "lm_log" ~ "LM log1p",
+      model == "glmnet_log" ~ "GLMNET log1p", 
+      model == "lgbm_log" ~ "LightGBM log1p",
+      model == "xgb_log" ~ "XGBoost log1p",
+      model == "xgb_poi" ~ "XGBoost Poisson",
+      model == "lgbm_twd" ~ "LightGBM Tweedie",
+      TRUE ~ model
+    ),
+    model_type = "Single-stage",
+    is_best = model == "lm_log"
+  )
+
+# Prepare two-stage Stage 2 severity data
+tsr_stage2_plot <- tsr_stage2_metrics |>
+  select(model, rmse) |>
+  mutate(
+    model_name = case_when(
+      model == "gamma_lgbm" ~ "Gamma LightGBM",
+      model == "gamma_xgb" ~ "Gamma XGBoost", 
+      model == "lgbm_log" ~ "LightGBM log1p",
+      model == "xgb_log" ~ "XGBoost log1p",
+      model == "glmnet_log" ~ "GLMNET log1p",
+      model == "lm_log" ~ "LM log1p",
+      TRUE ~ model
+    ),
+    model_type = "Stage 2",
+    is_best = model == "gamma_lgbm"
+  )
+
+# Create aligned comparison dataframe
+comparison_data <- tibble(
+  model_name = factor(all_models, levels = rev(all_models)),  # Reverse order so best is at top
+  single_stage_rmse = NA_real_,
+  stage2_rmse = NA_real_,
+  single_stage_selected = FALSE,
+  stage2_selected = FALSE
+)
+
+# Fill in single-stage values
+for(i in seq_along(sst_nonzero_plot$model_name)) {
+  idx <- which(comparison_data$model_name == sst_nonzero_plot$model_name[i])
+  if(length(idx) > 0) {
+    comparison_data$single_stage_rmse[idx] <- sst_nonzero_plot$rmse[i]
+    comparison_data$single_stage_selected[idx] <- sst_nonzero_plot$is_best[i]
+  }
+}
+
+# Fill in stage 2 values  
+for(i in seq_along(tsr_stage2_plot$model_name)) {
+  idx <- which(comparison_data$model_name == tsr_stage2_plot$model_name[i])
+  if(length(idx) > 0) {
+    comparison_data$stage2_rmse[idx] <- tsr_stage2_plot$rmse[i]
+    comparison_data$stage2_selected[idx] <- tsr_stage2_plot$is_best[i]
+  }
+}
+
+# Pivot to long format for plotting
+plot_data <- comparison_data |>
+  pivot_longer(
+    cols = c(single_stage_rmse, stage2_rmse),
+    names_to = "model_type",
+    values_to = "rmse",
+    values_drop_na = TRUE
+  ) |>
+  mutate(
+    model_type = case_when(
+      model_type == "single_stage_rmse" ~ "Single-stage",
+      model_type == "stage2_rmse" ~ "Stage 2"
+    ),
+    is_selected = case_when(
+      model_type == "Single-stage" ~ single_stage_selected,
+      model_type == "Stage 2" ~ stage2_selected
+    ),
+    selection_status = if_else(is_selected, "Selected Model", "Not Selected")
+  )
+
+# Create side-by-side RMSE comparison
+fig3 <- ggplot(plot_data, aes(x = rmse, y = model_name, color = model_type, size = selection_status)) +
+  geom_point() +
+  scale_color_manual(values = c("Single-stage" = viridis::turbo(10)[3], "Stage 2" = viridis::turbo(10)[8]), name = "Model Type") +
+  scale_size_manual(values = c("Not Selected" = 2, "Selected Model" = 3), name = "Selection") +
+  guides(color = guide_legend(order = 1), size = guide_legend(order = 2)) +
+  labs(
+    x = "RMSE",
+    y = "Model"
+  ) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    legend.spacing.y = unit(0.5, "cm")
+  )
+
+print(fig3)
+
+# Save figure
+ggsave("plots/fig3_nonzero_performance.png", fig3, width = 12, height = 8, dpi = 300)
+ggsave("plots/fig3_nonzero_performance.pdf", fig3, width = 12, height = 8)
+```
+
+## Figure 4: Predictions vs Actuals Time Series
+
+```{r}
+#| label: fig4-time-series
+
+# Figure 4: Weekly Aggregated Time Series (Panel Data Visualization)
+# Following ML best practices: aggregate panel data to weekly totals for time series evaluation
+# Data: 80,600 rows (52 weeks × 1,550 ADM1 regions) → aggregated to 52 weeks
+
+cat("Loading prediction data for temporal aggregation...\n")
+
+# Check memory usage before processing
+mem_before <- gc(verbose = FALSE)
+cat("Memory before processing:", mem_before[2,2], "MB\n")
+
+# Load data with explicit column selection
+tsr_data <- tsr_test_predictions |>
+  select(date, actual_count, expected_count)
+
+sst_data <- sst_predictions |>
+  select(date, .pred)
+
+cat("Data loaded. Rows in tsr_data:", nrow(tsr_data), "\n")
+cat("Data loaded. Rows in sst_data:", nrow(sst_data), "\n")
+cat("Unique dates:", length(unique(tsr_data$date)), "\n")
+
+# Aggregate to weekly totals (sum across all regions per week)
+# This is standard practice for evaluating panel forecasts
+cat("Aggregating to weekly totals across all regions...\n")
+
+weekly_tsr <- tsr_data |>
+  group_by(date) |>
+  summarise(
+    actual_total = sum(actual_count, na.rm = TRUE),
+    tsr_pred_total = sum(expected_count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+weekly_sst <- sst_data |>
+  group_by(date) |>
+  summarise(
+    sst_pred_total = sum(.pred, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Join weekly aggregates (this is now a proper 1:1 join)
+time_series_data <- weekly_tsr |>
+  left_join(weekly_sst, by = "date") |>
+  select(date, actual = actual_total, sst_pred = sst_pred_total, tsr_pred = tsr_pred_total)
+
+# Clear intermediate objects
+rm(tsr_data, sst_data, weekly_tsr, weekly_sst)
+gc()
+
+cat("After aggregation. Rows in time_series_data:", nrow(time_series_data), "\n")
+
+# Pivot to long format for plotting
+time_series_data <- time_series_data |>
+  select(date, actual, sst_pred) |>  # Remove two-stage predictions
+  pivot_longer(cols = c(actual, sst_pred), 
+               names_to = "series", values_to = "count") |>
+  mutate(
+    series = case_when(
+      series == "actual" ~ "Actual",
+      series == "sst_pred" ~ "Single-stage (LM log1p)"
+    ),
+    series = fct_relevel(series, "Actual", "Single-stage (LM log1p)")
+  )
+
+# Check final memory usage
+mem_after <- gc(verbose = FALSE)
+cat("Memory after processing:", mem_after[2,2], "MB\n")
+
+# Create time series plot
+fig4 <- ggplot(time_series_data, aes(x = date, y = count, color = series, linetype = series)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = c("Actual" = "black", 
+                                "Single-stage (LM log1p)" = viridis::turbo(10)[3])) +
+  scale_linetype_manual(values = c("Actual" = "solid",
+                                   "Single-stage (LM log1p)" = "solid")) +
+  labs(
+    title = "Test Set Predictions vs Actual Strike Counts (Weekly Aggregates)",
+    subtitle = "Sum of strike counts across all 1,550 ADM1 regions per week",
+    x = "Date",
+    y = "Total Strike Count (All Regions)",
+    color = "Series",
+    linetype = "Series"
+  ) +
+  theme(legend.position = "bottom")
+
+# Panel B: Region-level scatter plot for model calibration assessment
+# Shows predicted vs actual at individual region-week level (all 80,600 points)
+cat("Creating region-level scatter plot...\n")
+
+# Load data for scatter plot - use bind_cols since both have same row order
+tsr_data <- tsr_test_predictions |>
+  select(actual_count, expected_count)
+
+sst_data <- sst_predictions |>
+  select(.pred)
+
+# Combine data by column binding (same row order, no join explosion)
+region_data <- bind_cols(
+  tsr_data,
+  sst_data |> rename(sst_pred = .pred)
+) |>
+  select(actual = actual_count, sst_pred, tsr_pred = expected_count)
+
+# Clear intermediate objects
+rm(tsr_data, sst_data)
+gc()
+
+cat("Region-level data prepared. Rows:", nrow(region_data), "\n")
+
+# Create scatter plot (Panel B) - single-stage only
+# Use density-based approach to handle 80,600 overlapping points
+fig4b <- ggplot(region_data, aes(x = actual, y = sst_pred)) +
+  geom_hex(bins = 30, alpha = 0.8) +  # Hexagonal binning for density visualization
+  scale_fill_viridis_c(option = "turbo", name = "Count", trans = "log10",
+                       begin = 0.2, end = 0.5) +  # Use blue range to match line chart
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 1, color = "black") +
+  labs(
+    title = "B) Region-Level Calibration",
+    subtitle = "80,600 region-week predictions (hexagonal binning)",
+    x = "Actual Strike Count",
+    y = "Predicted Strike Count"
+  ) +
+  theme(legend.position = "right")
+
+# Combine Panel A (time series) and Panel B (scatter) side-by-side
+fig4_combined <- (fig4 + labs(title = "A) Weekly Aggregated Time Series")) | fig4b
+
+# Print combined figure
+fig4_combined
+
+print(fig4_combined)
+
+# Save combined figure
+ggsave("plots/fig4_combined.png", fig4_combined, width = 18, height = 7, dpi = 300)
+ggsave("plots/fig4_combined.pdf", fig4_combined, width = 18, height = 7)
+
+# Also save individual panels for flexibility
+ggsave("plots/fig4a_time_series.png", fig4, width = 10, height = 6, dpi = 300)
+ggsave("plots/fig4a_time_series.pdf", fig4, width = 10, height = 6)
+ggsave("plots/fig4b_region_scatter.png", fig4b, width = 10, height = 6, dpi = 300)
+ggsave("plots/fig4b_region_scatter.pdf", fig4b, width = 10, height = 6)
+```
+
+## Figure 5: Feature Importance - Best Single-Stage Model
+
+```{r}
+#| label: fig5-feature-importance
+
+library(tidymodels)
+
+# Load the best fitted model
+best_model_fit <- readRDS("model_outputs/sst_best_fitted_model_rmse.rds")
+
+# Load pretest data for standardization
+pretest_data <- read_parquet("data/analysis/adm_week_full.parquet") |>
+  clean_names() |>
+  filter(date < 19995)  # Test period starts September 29, 2024 (numeric date 19995)
+
+# Extract coefficients from the linear model
+lm_coefs <- best_model_fit$fit$fit$fit$coefficients
+
+# Get the model matrix to identify which predictors were used
+# We need to recreate the recipe to get the processed data
+tree_recipe <- recipe(strike_count ~ ., data = pretest_data) |>
+  update_role(date, new_role = "id") |>
+  step_novel(action_geo_adm1_code, action_geo_country_code) |>
+  step_other(action_geo_adm1_code, threshold = 0.02) |>
+  step_mutate(is_year_end = as.numeric(is_year_end)) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.999) |>
+  step_zv(all_predictors())
+
+# Apply recipe to get processed data
+processed_data <- tree_recipe |>
+  step_log(strike_count, offset = 1, skip = TRUE) |>
+  prep() |>
+  bake(new_data = pretest_data)
+
+# Compute standard deviations for standardization
+outcome_sd <- sd(log1p(pretest_data$strike_count), na.rm = TRUE)
+
+# Create coefficient data frame
+coef_df <- tibble(
+  feature = names(lm_coefs),
+  raw_coef = as.numeric(lm_coefs)
+) |>
+  # Remove intercept
+  filter(feature != "(Intercept)") |>
+  # Remove dummy variable reference levels (those with NA coefficients)
+  filter(!is.na(raw_coef)) |>
+  # Compute standardized coefficients
+  mutate(
+    # Get predictor standard deviations from processed data
+    predictor_sd = map_dbl(feature, ~ {
+      if (.x %in% names(processed_data)) {
+        sd(processed_data[[.x]], na.rm = TRUE)
+      } else {
+        # For dummy variables, use 1 (they're already 0/1)
+        1
+      }
+    }),
+    std_coef = raw_coef * predictor_sd / outcome_sd,
+    abs_coef = abs(std_coef)
+  ) |>
+  # Select top 15 features
+  arrange(desc(abs_coef)) |>
+  head(15) |>
+  # Clean up feature names for publication
+  mutate(
+    feature_clean = case_when(
+      str_detect(feature, "strike_count_lag1") ~ "Strike Count (lag 1)",
+      str_detect(feature, "strike_count_lag2") ~ "Strike Count (lag 2)", 
+      str_detect(feature, "strike_count_lag4") ~ "Strike Count (lag 4)",
+      str_detect(feature, "rolling_avg_4wk") ~ "Rolling 4-week Average",
+      str_detect(feature, "rolling_avg_8wk") ~ "Rolling 8-week Average",
+      str_detect(feature, "total_articles_lag1") ~ "Total Articles (lag 1)",
+      str_detect(feature, "total_articles_lag2") ~ "Total Articles (lag 2)",
+      str_detect(feature, "total_mentions_lag1") ~ "Total Mentions (lag 1)",
+      str_detect(feature, "total_mentions_lag2") ~ "Total Mentions (lag 2)",
+      str_detect(feature, "avg_tone_lag1") ~ "Average Tone (lag 1)",
+      str_detect(feature, "avg_tone_lag2") ~ "Average Tone (lag 2)",
+      str_detect(feature, "actor_diversity_lag1") ~ "Actor Diversity (lag 1)",
+      str_detect(feature, "unique_actor1_types_lag1") ~ "Unique Actor1 Types (lag 1)",
+      str_detect(feature, "unique_actor2_types_lag1") ~ "Unique Actor2 Types (lag 1)",
+      str_detect(feature, "prop_gov_lag1") ~ "Proportion Government (lag 1)",
+      str_detect(feature, "prop_labor_lag1") ~ "Proportion Labor (lag 1)",
+      str_detect(feature, "prop_civil_lag1") ~ "Proportion Civil Society (lag 1)",
+      str_detect(feature, "country_strikes_lag1") ~ "Country Strikes (lag 1)",
+      str_detect(feature, "contig_strikes_t1") ~ "Contiguous Strikes (t-1)",
+      str_detect(feature, "distw_strikes_t1") ~ "Distance-weighted Strikes (t-1)",
+      str_detect(feature, "time_trend") ~ "Time Trend",
+      str_detect(feature, "year_sin") ~ "Year (sine)",
+      str_detect(feature, "year_cos") ~ "Year (cosine)",
+      str_detect(feature, "month") ~ "Month",
+      str_detect(feature, "quarter") ~ "Quarter",
+      str_detect(feature, "is_year_end") ~ "Year End",
+      str_detect(feature, "action_geo_adm1_code") ~ "ADM1 Region",
+      str_detect(feature, "action_geo_country_code") ~ "Country",
+      TRUE ~ str_replace_all(feature, "_", " ") |> str_to_title()
+    ),
+    # Order by absolute coefficient magnitude
+    feature_clean = fct_reorder(feature_clean, abs_coef),
+    # Color by sign
+    coef_sign = if_else(std_coef > 0, "Positive", "Negative")
+  )
+
+# Create the plot
+fig5 <- ggplot(coef_df, aes(x = std_coef, y = feature_clean, fill = coef_sign)) +
+  geom_col(alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  scale_fill_manual(
+    values = c("Positive" = viridis::turbo(10)[3], "Negative" = viridis::turbo(10)[8]),
+    name = "Coefficient Sign"
+  ) +
+  labs(
+    title = "Feature Importance: Best Single-Stage Model (LM log1p)",
+    subtitle = "Standardized coefficients for top 15 predictors",
+    x = "Standardized Coefficient",
+    y = "Feature"
+  ) +
+  theme(
+    legend.position = "right",
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11)
+  )
+
+print(fig5)
+
+# Save figure
+ggsave("plots/fig5_feature_importance.png", fig5, width = 10, height = 8, dpi = 300)
+ggsave("plots/fig5_feature_importance.pdf", fig5, width = 10, height = 8)
+```
+
+## Supplementary Figures
+
+### Figure S1: Full Baseline Comparison
+
+```{r}
+#| label: figS1-baseline-comparison
+
+# Combine all baselines
+all_baselines <- bind_rows(
+  sst_naive_test |> mutate(model_class = "Single-stage Baselines"),
+  tsr_naive_combined |> mutate(model_class = "Two-stage Baselines")
+) |>
+  arrange(rmse) |>
+  mutate(model = fct_reorder(model, rmse))
+
+figS1 <- ggplot(all_baselines, aes(x = rmse, y = model, color = model_class)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Single-stage Baselines" = viridis::turbo(10)[3], "Two-stage Baselines" = viridis::turbo(10)[8])) +
+  labs(
+    title = "All Baseline Models Ranked by RMSE",
+    x = "RMSE",
+    y = "Baseline Model",
+    color = "Model Class"
+  )
+
+print(figS1)
+
+ggsave("plots/figS1_baseline_comparison.png", figS1, width = 10, height = 6, dpi = 300)
+ggsave("plots/figS1_baseline_comparison.pdf", figS1, width = 10, height = 6)
+```
+
+### Figure S2: RMSE vs MAE Selection Robustness
+
+```{r}
+#| label: figS2-rmse-mae-comparison
+
+# Prepare comparison data
+rmse_mae_comparison <- sst_val_summary |>
+  left_join(sst_val_summary_mae |> select(model, mae_selection_rmse = rmse, mae_selection_mae = mae), by = "model") |>
+  mutate(
+    model_name = case_when(
+      model == "lm_log" ~ "LM log1p",
+      model == "glmnet_log" ~ "GLMNET log1p",
+      model == "lgbm_log" ~ "LightGBM log1p", 
+      model == "xgb_log" ~ "XGBoost log1p",
+      model == "lgbm_poi" ~ "LightGBM Poisson",
+      model == "xgb_poi" ~ "XGBoost Poisson",
+      model == "lgbm_twd" ~ "LightGBM Tweedie",
+      TRUE ~ model
+    )
+  ) |>
+  select(model_name, rmse_selection = rmse, mae_selection = mae_selection_rmse) |>
+  pivot_longer(cols = c(rmse_selection, mae_selection), names_to = "selection_metric", values_to = "rmse") |>
+  mutate(
+    selection_metric = case_when(
+      selection_metric == "rmse_selection" ~ "RMSE Selection",
+      selection_metric == "mae_selection" ~ "MAE Selection"
+    )
+  )
+
+figS2 <- ggplot(rmse_mae_comparison, aes(x = rmse, y = model_name, color = selection_metric)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("RMSE Selection" = viridis::turbo(10)[3], "MAE Selection" = viridis::turbo(10)[8])) +
+  labs(
+    title = "Model Rankings: RMSE vs MAE Selection",
+    x = "RMSE",
+    y = "Model", 
+    color = "Selection Metric"
+  )
+
+print(figS2)
+
+ggsave("plots/figS2_rmse_mae_comparison.png", figS2, width = 10, height = 6, dpi = 300)
+ggsave("plots/figS2_rmse_mae_comparison.pdf", figS2, width = 10, height = 6)
+```
+
+### Figure S3: Calibration Assessment
+
+```{r}
+#| label: figS3-calibration
+
+# Calibration curves
+if(nrow(tsr_cal_curves) > 0) {
+  figS3 <- ggplot(tsr_cal_curves, aes(x = x, y = y, color = model)) +
+    geom_line(linewidth = 1) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    labs(
+      title = "Calibration Curves for Two-Stage Occurrence Classifiers",
+      x = "Predicted Probability",
+      y = "Observed Frequency",
+      color = "Model"
+    ) +
+    theme(legend.position = "bottom")
+  
+  print(figS3)
+  
+  ggsave("plots/figS3_calibration.png", figS3, width = 10, height = 6, dpi = 300)
+  ggsave("plots/figS3_calibration.pdf", figS3, width = 10, height = 6)
+} else {
+  cat("No calibration curve data available.\n")
+}
+```
+
+### Figure S4: Residuals Analysis
+
+```{r}
+#| label: figS4-residuals
+
+# Single-stage residuals
+sst_residuals <- sst_predictions |>
+  mutate(
+    residual = .pred - strike_count,
+    model = "Single-stage (LM log1p)"
+  )
+
+# Two-stage residuals  
+tsr_residuals <- tsr_test_predictions |>
+  mutate(
+    residual = expected_count - actual_count,
+    model = "Two-stage (GLM + Gamma XGB)"
+  ) |>
+  rename(strike_count = actual_count)
+
+# Combine residuals
+all_residuals <- bind_rows(
+  sst_residuals |> select(date, strike_count, residual, model),
+  tsr_residuals |> select(date, strike_count, residual, model)
+)
+
+# Scatter plot: predicted vs actual
+p_scatter <- ggplot(all_residuals, aes(x = strike_count, y = residual, color = model)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = viridis::turbo(10)[10]) +
+  scale_color_manual(values = c("Single-stage (LM log1p)" = viridis::turbo(10)[3], "Two-stage (GLM + Gamma XGB)" = viridis::turbo(10)[8])) +
+  labs(
+    title = "Residuals vs Actual Strike Counts",
+    x = "Actual Strike Count",
+    y = "Residual (Predicted - Actual)",
+    color = "Model"
+  )
+
+# Residual distribution
+p_dist <- ggplot(all_residuals, aes(x = residual, fill = model)) +
+  geom_histogram(alpha = 0.7, bins = 30, position = "identity") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = viridis::turbo(10)[10]) +
+  scale_fill_manual(values = c("Single-stage (LM log1p)" = viridis::turbo(10)[3], "Two-stage (GLM + Gamma XGB)" = viridis::turbo(10)[8])) +
+  labs(
+    title = "Distribution of Residuals",
+    x = "Residual",
+    y = "Frequency",
+    fill = "Model"
+  )
+
+figS4 <- p_scatter | p_dist
+
+print(figS4)
+
+ggsave("plots/figS4_residuals.png", figS4, width = 15, height = 6, dpi = 300)
+ggsave("plots/figS4_residuals.pdf", figS4, width = 15, height = 6)
+```
+
+### Figure S6: Two-Stage Model Decomposition
+
+```{r}
+#| label: fig6-decomposition
+
+# Panel A: Occurrence probabilities
+p_occurrence <- ggplot(tsr_test_predictions, aes(x = prob_yes)) +
+  geom_histogram(bins = 20, alpha = 0.7, fill = viridis::turbo(10)[8]) +
+  geom_vline(aes(xintercept = mean(actual_count > 0)), color = viridis::turbo(10)[10], linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "A) Occurrence Probabilities",
+    x = "Predicted Probability of Strike",
+    y = "Frequency"
+  )
+
+# Panel B: Severity predictions (positives only)
+sev_data <- tsr_test_predictions |>
+  filter(actual_count > 0)
+
+p_severity <- ggplot(sev_data, aes(x = sev_hat, y = actual_count)) +
+  geom_point(alpha = 0.6, color = viridis::turbo(10)[8]) +
+  geom_abline(slope = 1, intercept = 0, color = viridis::turbo(10)[10], linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "B) Severity Predictions (Positives Only)",
+    x = "Predicted Severity",
+    y = "Actual Severity"
+  )
+
+# Panel C: Combined predictions
+p_combined <- ggplot(tsr_test_predictions, aes(x = expected_count, y = actual_count)) +
+  geom_point(alpha = 0.6, color = viridis::turbo(10)[8]) +
+  geom_abline(slope = 1, intercept = 0, color = viridis::turbo(10)[10], linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "C) Combined Predictions vs Actual",
+    x = "Expected Strike Count",
+    y = "Actual Strike Count"
+  )
+
+fig5 <- (p_occurrence | p_severity | p_combined)
+
+print(fig5)
+
+# Save figure
+ggsave("plots/fig6_decomposition.png", fig5, width = 15, height = 5, dpi = 300)
+ggsave("plots/fig6_decomposition.pdf", fig5, width = 15, height = 5)
+```
+
+### Figure S7: Zero vs Non-Zero Performance Stratification
+
+```{r}
+#| label: fig7-zero-nonzero
+
+# Prepare stratified performance data
+stratified_data <- sst_test_separate |>
+  filter(.metric %in% c("rmse", "mae")) |>
+  select(model, week_type, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  mutate(
+    model_name = case_when(
+      model == "lm_log" ~ "LM log1p",
+      TRUE ~ model
+    ),
+    week_type = case_when(
+      week_type == "zero" ~ "Zero Weeks",
+      week_type == "non_zero" ~ "Non-Zero Weeks"
+    )
+  )
+
+# Create grouped bar chart
+p_stratified_rmse <- ggplot(stratified_data, aes(x = week_type, y = rmse, fill = week_type)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_manual(values = c("Zero Weeks" = viridis::turbo(10)[1], "Non-Zero Weeks" = viridis::turbo(10)[5])) +
+  labs(title = "RMSE by Week Type", x = "Week Type", y = "RMSE") +
+  theme(legend.position = "none")
+
+p_stratified_mae <- ggplot(stratified_data, aes(x = week_type, y = mae, fill = week_type)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_manual(values = c("Zero Weeks" = viridis::turbo(10)[1], "Non-Zero Weeks" = viridis::turbo(10)[5])) +
+  labs(title = "MAE by Week Type", x = "Week Type", y = "MAE") +
+  theme(legend.position = "none")
+
+fig6 <- p_stratified_rmse | p_stratified_mae
+
+print(fig6)
+
+# Save figure
+ggsave("plots/fig7_zero_nonz_zero.png", fig6, width = 10, height = 5, dpi = 300)
+ggsave("plots/fig7_zero_nonz_zero.pdf", fig6, width = 10, height = 5)
+```

@@ -1,0 +1,362 @@
+---
+title: "Country Filter Exploration"
+format: html
+---
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(janitor)
+```
+
+## Load data
+
+```{r}
+#| label: load-data
+
+adm_full <- read_parquet("data/analysis/adm_week_full.parquet") |>
+  clean_names() |>
+  mutate(date = as.Date(date)) |>
+  select(date, strike_count, action_geo_country_code, action_geo_adm1_code) |>
+  arrange(date)
+
+glimpse(adm_full)
+```
+
+## Pretest/Test split (match modeling scripts)
+
+```{r}
+#| label: splits
+
+all_weeks <- sort(unique(adm_full$date))
+test_weeks <- tail(all_weeks, 52)
+
+pretest_df <- adm_full |>
+  filter(date < min(test_weeks))
+test_df <- adm_full |>
+  filter(date %in% test_weeks)
+
+cat("Pretest rows:", nrow(pretest_df), " Test rows:", nrow(test_df), "\n")
+```
+
+## Drop impact by leak-safe country eligibility rules
+
+```{r}
+#| label: country-filter-impact
+
+# Compute summary for a given threshold rule
+summarize_drop_impact <- function(thr_label, thr_value) {
+  thr_value_num <- suppressWarnings(as.numeric(thr_value))
+  if (is.na(thr_value_num)) {
+    # ever-positive rule (binary)
+    eligible <- pretest_df |>
+      group_by(action_geo_country_code) |>
+      summarise(any_pos = any(strike_count > 0, na.rm = TRUE), .groups = "drop") |>
+      filter(any_pos) |>
+      pull(action_geo_country_code)
+  } else {
+    # rate threshold (share of positive weeks in pretest)
+    eligible <- pretest_df |>
+      group_by(action_geo_country_code) |>
+      summarise(pos_rate = mean(strike_count > 0, na.rm = TRUE), .groups = "drop") |>
+      filter(pos_rate >= thr_value_num) |>
+      pull(action_geo_country_code)
+  }
+
+  pre_f <- pretest_df |> filter(action_geo_country_code %in% eligible)
+  test_f <- test_df    |> filter(action_geo_country_code %in% eligible)
+
+  tibble(
+    rule = thr_label,
+    countries_pretest_total = n_distinct(pretest_df$action_geo_country_code),
+    countries_pretest_kept  = n_distinct(pre_f$action_geo_country_code),
+    countries_pretest_drop  = countries_pretest_total - countries_pretest_kept,
+    countries_test_total    = n_distinct(test_df$action_geo_country_code),
+    countries_test_kept     = n_distinct(test_f$action_geo_country_code),
+    countries_test_drop     = countries_test_total - countries_test_kept,
+    rows_pretest_before     = nrow(pretest_df),
+    rows_pretest_after      = nrow(pre_f),
+    pretest_drop_pct        = 1 - rows_pretest_after / pmax(rows_pretest_before, 1),
+    rows_test_before        = nrow(test_df),
+    rows_test_after         = nrow(test_f),
+    test_drop_pct           = 1 - rows_test_after / pmax(rows_test_before, 1),
+    adm1_pretest_total      = n_distinct(pretest_df$action_geo_adm1_code),
+    adm1_pretest_kept       = n_distinct(pre_f$action_geo_adm1_code),
+    adm1_pretest_drop       = adm1_pretest_total - adm1_pretest_kept,
+    adm1_test_total         = n_distinct(test_df$action_geo_adm1_code),
+    adm1_test_kept          = n_distinct(test_f$action_geo_adm1_code),
+    adm1_test_drop          = adm1_test_total - adm1_test_kept
+  )
+}
+
+thr_list <- list(
+  ever = NA_real_,
+  rate_0_001 = 0.001,
+  rate_0_002 = 0.002,
+  rate_0_005 = 0.005
+)
+
+drop_summary <- purrr::imap_dfr(thr_list, ~ summarize_drop_impact(.y, .x)) |>
+  mutate(
+    pretest_drop_pct = scales::percent(pretest_drop_pct, accuracy = 0.1),
+    test_drop_pct    = scales::percent(test_drop_pct, accuracy = 0.1)
+  )
+
+drop_summary |>
+  arrange(desc(rows_test_before - rows_test_after)) |>
+  print(n = Inf)
+```
+
+## Row drops (explicit counts)
+
+```{r}
+#| label: row-drops-counts
+
+drop_summary |>
+  transmute(
+    rule,
+    rows_pretest_drop = rows_pretest_before - rows_pretest_after,
+    pretest_drop_pct,
+    rows_test_drop = rows_test_before - rows_test_after,
+    test_drop_pct
+  ) |>
+  arrange(desc(rows_test_drop)) |>
+  print(n = Inf)
+```
+
+## Country contributions to row drops (accounts for different ADM1 counts)
+
+```{r}
+#| label: country-drop-breakdown
+
+country_rows_pre <- pretest_df |>
+  count(action_geo_country_code, name = "rows_pretest")
+country_rows_test <- test_df |>
+  count(action_geo_country_code, name = "rows_test")
+adm1_per_country <- pretest_df |>
+  distinct(action_geo_country_code, action_geo_adm1_code) |>
+  count(action_geo_country_code, name = "adm1_count_pretest")
+
+country_drop_table <- function(thr_label, thr_value) {
+  thr_value_num <- suppressWarnings(as.numeric(thr_value))
+  if (is.na(thr_value_num)) {
+    elig <- pretest_df |>
+      group_by(action_geo_country_code) |>
+      summarise(any_pos = any(strike_count > 0, na.rm = TRUE), .groups = "drop") |>
+      filter(any_pos) |>
+      pull(action_geo_country_code)
+  } else {
+    elig <- pretest_df |>
+      group_by(action_geo_country_code) |>
+      summarise(pos_rate = mean(strike_count > 0, na.rm = TRUE), .groups = "drop") |>
+      filter(pos_rate >= thr_value_num) |>
+      pull(action_geo_country_code)
+  }
+
+  country_rows_pre |>
+    full_join(country_rows_test, by = "action_geo_country_code") |>
+    left_join(adm1_per_country, by = "action_geo_country_code") |>
+    mutate(
+      rows_pretest = coalesce(rows_pretest, 0L),
+      rows_test = coalesce(rows_test, 0L),
+      adm1_count_pretest = coalesce(adm1_count_pretest, 0L),
+      kept = action_geo_country_code %in% elig,
+      rows_pretest_dropped = if_else(kept, 0L, rows_pretest),
+      rows_test_dropped = if_else(kept, 0L, rows_test),
+      rule = thr_label
+    ) |>
+    arrange(desc(rows_test_dropped))
+}
+
+country_drops <- purrr::imap_dfr(thr_list, ~ country_drop_table(.y, .x))
+
+# Per-rule totals (kept/dropped counts and rows)
+rule_totals <- country_drops |>
+  group_by(rule) |>
+  summarise(
+    countries_kept = sum(kept),
+    countries_dropped = sum(!kept),
+    rows_pretest_dropped = sum(rows_pretest_dropped),
+    rows_test_dropped = sum(rows_test_dropped),
+    .groups = "drop"
+  )
+print(rule_totals)
+
+# Top dropped countries per rule (only those actually dropped)
+top_dropped <- country_drops |>
+  filter(rows_test_dropped > 0) |>
+  group_by(rule) |>
+  slice_max(order_by = rows_test_dropped, n = 15, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(rule, desc(rows_test_dropped))
+
+if (nrow(top_dropped) == 0) {
+  cat("No countries dropped under any rule.\n")
+} else {
+  print(top_dropped, n = Inf)
+}
+
+```
+
+## ADM1-level filter impact (ever-positive / min positives / min rate)
+
+```{r}
+#| label: adm1-filter-impact
+
+# Precompute ADM1-level stats on pretest
+adm1_stats_pre <- pretest_df |>
+  group_by(action_geo_adm1_code, action_geo_country_code) |>
+  summarise(
+    weeks = n(),
+    pos_weeks = sum(strike_count > 0, na.rm = TRUE),
+    pos_rate = pos_weeks / weeks,
+    .groups = "drop"
+  )
+
+adm1_rows_pre <- pretest_df |>
+  count(action_geo_adm1_code, action_geo_country_code, name = "rows_pretest")
+adm1_rows_test <- test_df |>
+  count(action_geo_adm1_code, action_geo_country_code, name = "rows_test")
+
+# Define ADM1 rules
+adm1_rules <- list(
+  ever = list(min_pos = 1L, min_rate = NA_real_),
+  min_pos_2 = list(min_pos = 2L, min_rate = NA_real_),
+  min_pos_4 = list(min_pos = 4L, min_rate = NA_real_),
+  rate_0_001 = list(min_pos = NA_integer_, min_rate = 0.001),
+  rate_0_002 = list(min_pos = NA_integer_, min_rate = 0.002),
+  rate_0_005 = list(min_pos = NA_integer_, min_rate = 0.005)
+)
+
+eligible_adm1 <- function(rule) {
+  if (!is.na(rule$min_pos)) {
+    adm1_stats_pre |>
+      filter(pos_weeks >= rule$min_pos) |>
+      pull(action_geo_adm1_code)
+  } else if (!is.na(rule$min_rate)) {
+    adm1_stats_pre |>
+      filter(pos_rate >= rule$min_rate) |>
+      pull(action_geo_adm1_code)
+  } else {
+    adm1_stats_pre |>
+      filter(pos_weeks > 0) |>
+      pull(action_geo_adm1_code)
+  }
+}
+
+summarize_adm1_drop_impact <- function(thr_label, rule) {
+  elig <- eligible_adm1(rule)
+
+  pre_f <- pretest_df |> filter(action_geo_adm1_code %in% elig)
+  test_f <- test_df    |> filter(action_geo_adm1_code %in% elig)
+
+  tibble(
+    rule = thr_label,
+    adm1_pretest_total = n_distinct(pretest_df$action_geo_adm1_code),
+    adm1_pretest_kept  = n_distinct(pre_f$action_geo_adm1_code),
+    adm1_pretest_drop  = adm1_pretest_total - adm1_pretest_kept,
+    rows_pretest_before = nrow(pretest_df),
+    rows_pretest_after  = nrow(pre_f),
+    pretest_drop_pct     = 1 - rows_pretest_after / pmax(rows_pretest_before, 1),
+    rows_test_before     = nrow(test_df),
+    rows_test_after      = nrow(test_f),
+    test_drop_pct        = 1 - rows_test_after / pmax(rows_test_before, 1)
+  )
+}
+
+drop_summary_adm1 <- purrr::imap_dfr(adm1_rules, ~ summarize_adm1_drop_impact(.y, .x)) |>
+  mutate(
+    pretest_drop_pct = scales::percent(pretest_drop_pct, accuracy = 0.1),
+    test_drop_pct    = scales::percent(test_drop_pct, accuracy = 0.1)
+  )
+
+drop_summary_adm1 |>
+  arrange(desc(rows_test_before - rows_test_after)) |>
+  print(n = Inf)
+```
+
+## ADM1s dropped per rule and country totals from ADM1 filtering
+
+```{r}
+#| label: adm1-dropped-breakdown
+
+adm1_drop_table <- function(thr_label, rule) {
+  elig <- eligible_adm1(rule)
+
+  adm1_rows_pre |>
+    full_join(adm1_rows_test, by = c("action_geo_adm1_code","action_geo_country_code")) |>
+    mutate(
+      rows_pretest = coalesce(rows_pretest, 0L),
+      rows_test = coalesce(rows_test, 0L),
+      kept = action_geo_adm1_code %in% elig,
+      rows_pretest_dropped = if_else(kept, 0L, rows_pretest),
+      rows_test_dropped = if_else(kept, 0L, rows_test),
+      rule = thr_label
+    ) |>
+    arrange(desc(rows_test_dropped))
+}
+
+adm1_drops <- purrr::imap_dfr(adm1_rules, ~ adm1_drop_table(.y, .x))
+
+# Top 20 ADM1 by test rows dropped per rule
+top_adm1_dropped <- adm1_drops |>
+  filter(rows_test_dropped > 0) |>
+  group_by(rule) |>
+  slice_max(order_by = rows_test_dropped, n = 20, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(rule, desc(rows_test_dropped))
+
+if (nrow(top_adm1_dropped) == 0) {
+  cat("No ADM1 regions dropped under any rule.\n")
+} else {
+  print(top_adm1_dropped, n = Inf)
+}
+
+# Country totals resulting from ADM1 filtering
+adm1_country_totals <- adm1_drops |>
+  group_by(rule, action_geo_country_code) |>
+  summarise(
+    rows_pretest_dropped = sum(rows_pretest_dropped),
+    rows_test_dropped = sum(rows_test_dropped),
+    adm1_dropped = sum(rows_test_dropped > 0),
+    .groups = "drop"
+  ) |>
+  arrange(rule, desc(rows_test_dropped))
+
+print(adm1_country_totals, n = 50)
+```
+
+## Optional: inspect countries dropped under each rule
+
+```{r}
+#| label: inspect-dropped
+#| eval: false
+
+inspect_dropped <- function(thr_value) {
+  if (is.na(thr_value)) {
+    elig <- pretest_df |>
+      group_by(action_geo_country_code) |>
+      summarise(any_pos = any(strike_count > 0), .groups = "drop") |>
+      filter(any_pos) |>
+      pull(action_geo_country_code)
+  } else {
+    elig <- pretest_df |>
+      group_by(action_geo_country_code) |>
+      summarise(pos_rate = mean(strike_count > 0), .groups = "drop") |>
+      filter(pos_rate >= thr_value) |>
+      pull(action_geo_country_code)
+  }
+  setdiff(unique(adm_full$action_geo_country_code), elig)
+}
+
+inspect_dropped(NA)      # ever-positive rule
+# inspect_dropped(0.002) # rate >= 0.2%
+```
+
+
