@@ -34,7 +34,7 @@ tidymodels_prefer()
 #| label: load-data
 
 # Load the GDELT strikes data
-all_strikes_data <- read_parquet("data/raw/gdelt_strikes.parquet")
+all_strikes_data <- read_parquet("../../data/raw/gdelt_strikes.parquet")
 
 # Check data structure
 glimpse(all_strikes_data)

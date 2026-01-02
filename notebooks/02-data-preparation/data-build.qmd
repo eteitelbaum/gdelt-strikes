@@ -29,7 +29,7 @@ conflicted::conflicts_prefer(dplyr::filter)
 ```{r}
 #| label: load-events
 
-events <- read_parquet("data/enhanced/gdelt_strikes.parquet") |>
+events <- read_parquet("../../data/enhanced/gdelt_strikes.parquet") |>
   clean_names() |>
   select(
     # identifiers and dates
@@ -294,15 +294,15 @@ adm_week_full <- weekly_strikes |>
     has_min_history_2
   )
 
-write_parquet(adm_week_full, "data/analysis/adm_week_full.parquet")
+write_parquet(adm_week_full, "../../../../data/analysis/adm_week_full.parquet")
 
 adm_week_positive <- adm_week_full |>
   filter(strike_count > 0)
 
-write_parquet(adm_week_positive, "data/analysis/adm_week_positive.parquet")
+write_parquet(adm_week_positive, "../../../../data/analysis/adm_week_positive.parquet")
 
-cat("Saved: data/analysis/adm_week_full.parquet (", nrow(adm_week_full), " rows)\n", sep = "")
-cat("Saved: data/analysis/adm_week_positive.parquet (", nrow(adm_week_positive), " rows)\n", sep = "")
+cat("Saved: ../../data/analysis/adm_week_full.parquet (", nrow(adm_week_full), " rows)\n", sep = "")
+cat("Saved: ../../data/analysis/adm_week_positive.parquet (", nrow(adm_week_positive), " rows)\n", sep = "")
 ```
 
 

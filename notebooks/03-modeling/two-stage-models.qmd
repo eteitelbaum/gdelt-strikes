@@ -30,7 +30,7 @@ set.seed(2024)
 RNGkind("L'Ecuyer-CMRG")
 
 # Load shared helpers (smearing, metrics utilities)
-source("helpers/helpers.R")
+source("../../helpers/helpers.R")
 
 registerDoFuture()
 plan(multisession, workers = 4)
@@ -46,7 +46,7 @@ options(future.globals.maxSize = 8 * 1024^3)
 # Choose either "rmse" or "mae"; affects tuning selection, combined selection, and output filenames
 sev_selection_metric <- "mae"
 
-adm_full <- read_parquet("data/analysis/adm_week_full.parquet") |>
+adm_full <- read_parquet("../../data/analysis/adm_week_full.parquet") |>
   clean_names()
 
 # Occurrence target
@@ -382,7 +382,7 @@ if ("glmnet" %in% occ_models_to_run) {
   )
   # Save tuning metrics and report evaluated counts
   met_occ_glmnet <- collect_metrics(occ_glmnet_tuned)
-  readr::write_csv(met_occ_glmnet, sprintf("model_outputs/tsr_tuning_metrics_occ_glmnet__%s.csv", sev_selection_metric))
+  readr::write_csv(met_occ_glmnet, sprintf("../../outputs/models/tsr_tuning_metrics_occ_glmnet__%s.csv", sev_selection_metric))
   cat("[Stage 1] GLMNET configs evaluated:", length(unique(met_occ_glmnet$.config)), "of", nrow(grid_glmnet), "\n")
   final_glmnet_occ <- finalize_workflow(occ_wfs$glmnet, select_best(occ_glmnet_tuned, metric = "pr_auc_yes"))
   cat("[Stage 1] Re-fitting GLMNET with best config...\n")
@@ -410,7 +410,7 @@ if ("lgbm" %in% occ_models_to_run) {
   )
   # Save tuning metrics and report evaluated counts
   met_occ_lgbm <- collect_metrics(occ_lgbm_tuned)
-  readr::write_csv(met_occ_lgbm, sprintf("model_outputs/tsr_tuning_metrics_occ_lgbm__%s.csv", sev_selection_metric))
+  readr::write_csv(met_occ_lgbm, sprintf("../../outputs/models/tsr_tuning_metrics_occ_lgbm__%s.csv", sev_selection_metric))
   cat("[Stage 1] LightGBM configs evaluated:", length(unique(met_occ_lgbm$.config)), "of", nrow(grid_boosted), "\n")
   final_lgbm_occ <- finalize_workflow(occ_wfs$lgbm, select_best(occ_lgbm_tuned, metric = "pr_auc_yes"))
   cat("[Stage 1] Re-fitting LightGBM with best config...\n")
@@ -438,7 +438,7 @@ if ("xgb" %in% occ_models_to_run) {
   )
   # Save tuning metrics and report evaluated counts
   met_occ_xgb <- collect_metrics(occ_xgb_tuned)
-  readr::write_csv(met_occ_xgb, sprintf("model_outputs/tsr_tuning_metrics_occ_xgb__%s.csv", sev_selection_metric))
+  readr::write_csv(met_occ_xgb, sprintf("../../outputs/models/tsr_tuning_metrics_occ_xgb__%s.csv", sev_selection_metric))
   cat("[Stage 1] XGBoost configs evaluated:", length(unique(met_occ_xgb$.config)), "of", nrow(grid_boosted), "\n")
   final_xgb_occ <- finalize_workflow(occ_wfs$xgb, select_best(occ_xgb_tuned, metric = "pr_auc_yes"))
   cat("[Stage 1] Re-fitting XGBoost with best config...\n")
@@ -468,7 +468,7 @@ if (length(occ_val_results) > 0) {
   print(occ_summary)
   
   # Save results
-  readr::write_csv(occ_summary, sprintf("model_outputs/tsr_stage1_occurrence_metrics__%s.csv", sev_selection_metric))
+  readr::write_csv(occ_summary, sprintf("../../outputs/models/tsr_stage1_occurrence_metrics__%s.csv", sev_selection_metric))
 } else {
   cat("\n[Stage 1] No models were run.\n")
   occ_summary <- tibble(model = character(0), pr_auc = numeric(0), roc_auc = numeric(0), brier = numeric(0))
@@ -550,7 +550,7 @@ iso_curves <- occ_calibration_info |>
   dplyr::bind_rows()
 
 if (nrow(iso_curves) > 0) {
-  readr::write_csv(iso_curves, sprintf("model_outputs/tsr_calibration_curves__%s.csv", sev_selection_metric))
+  readr::write_csv(iso_curves, sprintf("../../outputs/models/tsr_calibration_curves__%s.csv", sev_selection_metric))
 }
 
 cat("[Stage 1] Calibration complete for", length(occ_calibrated_predictions), "classifiers.\n")
@@ -592,7 +592,7 @@ cat("      brier_skill: improvement over baseline (like R²; higher is better)\n
 print(calib_results |> arrange(desc(pr_auc)))
 
 # Save calibration results
-readr::write_csv(calib_results, sprintf("model_outputs/tsr_stage1_calibration_results__%s.csv", sev_selection_metric))
+readr::write_csv(calib_results, sprintf("../../outputs/models/tsr_stage1_calibration_results__%s.csv", sev_selection_metric))
 
 cat("\n[Stage 1] Calibration reporting complete.\n")
 
@@ -600,7 +600,7 @@ cat("\n[Stage 1] Calibration reporting complete.\n")
 cat("[Stage 1] Saving calibrated predictions to disk...\n")
 arrow::write_parquet(
   bind_rows(occ_calibrated_predictions, .id = "model"),
-  sprintf("model_outputs/tsr_stage1_calibrated_predictions__%s.parquet", sev_selection_metric)
+  sprintf("../../outputs/models/tsr_stage1_calibrated_predictions__%s.parquet", sev_selection_metric)
 )
 ```
 
@@ -691,7 +691,7 @@ if ("glmnet_log" %in% sev_models_to_run) {
   )
   # Save tuning metrics and report evaluated counts
   met_sev_glmnet <- collect_metrics(sev_glmnet_tuned)
-  readr::write_csv(met_sev_glmnet, sprintf("model_outputs/tsr_tuning_metrics_sev_glmnet_log__%s.csv", sev_selection_metric))
+  readr::write_csv(met_sev_glmnet, sprintf("../../outputs/models/tsr_tuning_metrics_sev_glmnet_log__%s.csv", sev_selection_metric))
   cat("[Stage 2] GLMNET configs evaluated:", length(unique(met_sev_glmnet$.config)), "of", nrow(grid_glmnet), "\n")
   final_glmnet_sev <- finalize_workflow(sev_wfs$glmnet_log, select_best(sev_glmnet_tuned, metric = sev_selection_metric))
   cat("[Stage 2] Re-fitting GLMNET log with best config...\n")
@@ -739,7 +739,7 @@ if ("lgbm_log" %in% sev_models_to_run) {
   )
   # Save tuning metrics and report evaluated counts
   met_sev_lgbm <- collect_metrics(sev_lgbm_tuned)
-  readr::write_csv(met_sev_lgbm, sprintf("model_outputs/tsr_tuning_metrics_sev_lgbm_log__%s.csv", sev_selection_metric))
+  readr::write_csv(met_sev_lgbm, sprintf("../../outputs/models/tsr_tuning_metrics_sev_lgbm_log__%s.csv", sev_selection_metric))
   cat("[Stage 2] LightGBM configs evaluated:", length(unique(met_sev_lgbm$.config)), "of", nrow(grid_boosted), "\n")
   final_lgbm_sev <- finalize_workflow(sev_wfs$lgbm_log, select_best(sev_lgbm_tuned, metric = sev_selection_metric))
   cat("[Stage 2] Re-fitting LightGBM log with best config...\n")
@@ -787,7 +787,7 @@ if ("xgb_log" %in% sev_models_to_run) {
   )
   # Save tuning metrics and report evaluated counts
   met_sev_xgb <- collect_metrics(sev_xgb_tuned)
-  readr::write_csv(met_sev_xgb, sprintf("model_outputs/tsr_tuning_metrics_sev_xgb_log__%s.csv", sev_selection_metric))
+  readr::write_csv(met_sev_xgb, sprintf("../../outputs/models/tsr_tuning_metrics_sev_xgb_log__%s.csv", sev_selection_metric))
   cat("[Stage 2] XGBoost configs evaluated:", length(unique(met_sev_xgb$.config)), "of", nrow(grid_boosted), "\n")
   final_xgb_sev <- finalize_workflow(sev_wfs$xgb_log, select_best(sev_xgb_tuned, metric = sev_selection_metric))
   cat("[Stage 2] Re-fitting XGBoost log with best config...\n")
@@ -835,7 +835,7 @@ if ("gamma_lgbm" %in% sev_models_to_run) {
   )
   # Save tuning metrics and report evaluated counts
   met_sev_gamma_lgbm <- collect_metrics(sev_gamma_lgbm_tuned)
-  readr::write_csv(met_sev_gamma_lgbm, sprintf("model_outputs/tsr_tuning_metrics_sev_gamma_lgbm__%s.csv", sev_selection_metric))
+  readr::write_csv(met_sev_gamma_lgbm, sprintf("../../outputs/models/tsr_tuning_metrics_sev_gamma_lgbm__%s.csv", sev_selection_metric))
   cat("[Stage 2] Gamma LightGBM configs evaluated:", length(unique(met_sev_gamma_lgbm$.config)), "of", nrow(grid_boosted), "\n")
   final_gamma_lgbm_sev <- finalize_workflow(sev_wfs$gamma_lgbm, select_best(sev_gamma_lgbm_tuned, metric = sev_selection_metric))
   cat("[Stage 2] Re-fitting Gamma LightGBM with best config...\n")
@@ -877,7 +877,7 @@ if ("gamma_xgb" %in% sev_models_to_run) {
   )
   # Save tuning metrics and report evaluated counts
   met_sev_gamma_xgb <- collect_metrics(sev_gamma_xgb_tuned)
-  readr::write_csv(met_sev_gamma_xgb, sprintf("model_outputs/tsr_tuning_metrics_sev_gamma_xgb__%s.csv", sev_selection_metric))
+  readr::write_csv(met_sev_gamma_xgb, sprintf("../../outputs/models/tsr_tuning_metrics_sev_gamma_xgb__%s.csv", sev_selection_metric))
   cat("[Stage 2] Gamma XGBoost configs evaluated:", length(unique(met_sev_gamma_xgb$.config)), "of", nrow(grid_boosted), "\n")
   final_gamma_xgb_sev <- finalize_workflow(sev_wfs$gamma_xgb, select_best(sev_gamma_xgb_tuned, metric = sev_selection_metric))
   cat("[Stage 2] Re-fitting Gamma XGBoost with best config...\n")
@@ -938,13 +938,13 @@ if (length(sev_val_results) > 0) {
   print(sev_summary)
   
   # Save results
-  readr::write_csv(sev_summary, sprintf("model_outputs/tsr_stage2_severity_metrics__%s.csv", sev_selection_metric))
+  readr::write_csv(sev_summary, sprintf("../../outputs/models/tsr_stage2_severity_metrics__%s.csv", sev_selection_metric))
   
   # Save severity predictions on all rows for later analysis
   cat("\n[Stage 2] Saving severity predictions (all rows) to disk...\n")
   arrow::write_parquet(
     bind_rows(sev_val_predictions_all_rows, .id = "model"),
-    sprintf("model_outputs/tsr_stage2_predictions_all_rows__%s.parquet", sev_selection_metric)
+    sprintf("../../outputs/models/tsr_stage2_predictions_all_rows__%s.parquet", sev_selection_metric)
   )
 } else {
   cat("\n[Stage 2] No severity models were run.\n")
@@ -1004,7 +1004,7 @@ cat("[Selection] Combined ", toupper(sev_selection_metric), ": ",
     round(joint_summary[[paste0("combined_", sev_selection_metric)]][1], 4), "\n", sep = "")
 
 # Save results
-readr::write_csv(joint_summary, sprintf("model_outputs/tsr_joint_optimization_results__%s.csv", sev_selection_metric))
+readr::write_csv(joint_summary, sprintf("../../outputs/models/tsr_joint_optimization_results__%s.csv", sev_selection_metric))
 
 # Save best selection info
 best_selection <- list(
@@ -1016,7 +1016,7 @@ best_selection <- list(
   combined_mae = joint_summary$combined_mae[1],
   combined_rsq = joint_summary$combined_rsq[1]
 )
-saveRDS(best_selection, sprintf("model_outputs/tsr_best_pipeline_selection__%s.rds", sev_selection_metric))
+saveRDS(best_selection, sprintf("../../outputs/models/tsr_best_pipeline_selection__%s.rds", sev_selection_metric))
 ```
 
 ## Test Set Evaluation
@@ -1127,12 +1127,12 @@ arrow::write_parquet(
     expected_count = combined_hat_test,
     actual_count = test_df$strike_count
   ),
-  sprintf("model_outputs/two_stage_refined_test_predictions__%s.parquet", sev_selection_metric)
+  sprintf("../../outputs/models/two_stage_refined_test_predictions__%s.parquet", sev_selection_metric)
 )
 
-readr::write_csv(occ_tbl, sprintf("model_outputs/two_stage_refined_test_occ__%s.csv", sev_selection_metric))
-readr::write_csv(sev_tbl, sprintf("model_outputs/two_stage_refined_test_sev__%s.csv", sev_selection_metric))
-readr::write_csv(combined_tbl, sprintf("model_outputs/two_stage_refined_test_combined__%s.csv", sev_selection_metric))
+readr::write_csv(occ_tbl, sprintf("../../outputs/models/two_stage_refined_test_occ__%s.csv", sev_selection_metric))
+readr::write_csv(sev_tbl, sprintf("../../outputs/models/two_stage_refined_test_sev__%s.csv", sev_selection_metric))
+readr::write_csv(combined_tbl, sprintf("../../outputs/models/two_stage_refined_test_combined__%s.csv", sev_selection_metric))
 
 # Save complete selection info
 final_selection_info <- list(
@@ -1148,7 +1148,7 @@ final_selection_info <- list(
   test_combined_rsq = combined_tbl$.estimate[combined_tbl$.metric == "rsq"]
 )
 
-saveRDS(final_selection_info, sprintf("model_outputs/two_stage_refined_selection__%s.rds", sev_selection_metric))
+saveRDS(final_selection_info, sprintf("../../outputs/models/two_stage_refined_selection__%s.rds", sev_selection_metric))
 
 cat("[Test] Evaluation complete!\n")
 ```
@@ -1171,7 +1171,7 @@ if (best_clf %in% c("lgbm", "xgb")) {
   # Save
   arrow::write_parquet(
     occ_importance,
-    sprintf("model_outputs/tsr_stage1_feature_importance__%s.parquet", sev_selection_metric)
+    sprintf("../../outputs/models/tsr_stage1_feature_importance__%s.parquet", sev_selection_metric)
   )
   
   cat("[Importance] Top 10 features for Stage 1 (occurrence):\n")
@@ -1192,7 +1192,7 @@ if (best_sev %in% c("lgbm_log", "xgb_log", "gamma_lgbm", "gamma_xgb")) {
   # Save
   arrow::write_parquet(
     sev_importance,
-    sprintf("model_outputs/tsr_stage2_feature_importance__%s.parquet", sev_selection_metric)
+    sprintf("../../outputs/models/tsr_stage2_feature_importance__%s.parquet", sev_selection_metric)
   )
   
   cat("[Importance] Top 10 features for Stage 2 (severity):\n")
@@ -1281,7 +1281,7 @@ cat("\n[Naive Baselines] Stage 1 (occurrence) validation set results (ranked by 
 print(naive_stage1_val_summary)
 
 # Save Stage 1 validation baseline results (metric-agnostic filename)
-readr::write_csv(naive_stage1_val_summary, "model_outputs/tsr_naive_stage1_validation.csv")
+readr::write_csv(naive_stage1_val_summary, "../../outputs/models/tsr_naive_stage1_validation.csv")
 
 cat("\n[Naive Baselines] Stage 1 validation baselines saved.\n")
 ```
@@ -1374,7 +1374,7 @@ cat("\n[Naive Baselines] Stage 2 (severity) validation set results (ranked by RM
 print(naive_stage2_val_summary)
 
 # Save Stage 2 validation baseline results (metric-agnostic filename)
-readr::write_csv(naive_stage2_val_summary, "model_outputs/tsr_naive_stage2_validation.csv")
+readr::write_csv(naive_stage2_val_summary, "../../outputs/models/tsr_naive_stage2_validation.csv")
 
 cat("\n[Naive Baselines] Stage 2 validation baselines saved.\n")
 ```
@@ -1459,7 +1459,7 @@ cat("\n[Naive Baselines] Combined (two-stage) test set results (ranked by RMSE):
 print(naive_combined_test_summary)
 
 # Save combined test baseline results (metric-agnostic filename)
-readr::write_csv(naive_combined_test_summary, "model_outputs/tsr_naive_combined_test.csv")
+readr::write_csv(naive_combined_test_summary, "../../outputs/models/tsr_naive_combined_test.csv")
 
 cat("\n[Naive Baselines] Combined test baselines saved. Comparison tables will be created during writeup.\n")
 

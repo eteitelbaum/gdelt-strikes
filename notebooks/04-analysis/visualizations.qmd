@@ -57,36 +57,36 @@ dir.create("plots", showWarnings = FALSE)
 #| label: load-data
 
 # Single-stage validation results
-sst_val_summary <- read_csv("model_outputs/sst_val_summary_rmse.csv")
-sst_val_separate <- read_csv("model_outputs/sst_val_separate_metrics_rmse.csv")
-sst_test_separate <- read_csv("model_outputs/sst_test_separate_metrics_rmse.csv")
+sst_val_summary <- read_csv("../../outputs/models/sst_val_summary_rmse.csv")
+sst_val_separate <- read_csv("../../outputs/models/sst_val_separate_metrics_rmse.csv")
+sst_test_separate <- read_csv("../../outputs/models/sst_test_separate_metrics_rmse.csv")
 
 # Single-stage test results
-sst_model_metadata <- read_csv("model_outputs/sst_model_metadata_rmse.csv")
-sst_predictions <- read_parquet("model_outputs/sst_predictions__rmse.parquet")
+sst_model_metadata <- read_csv("../../outputs/models/sst_model_metadata_rmse.csv")
+sst_predictions <- read_parquet("../../outputs/models/sst_predictions__rmse.parquet")
 
 # Two-stage validation results
-tsr_joint_opt <- read_csv("model_outputs/tsr_joint_optimization_results__rmse.csv")
-tsr_stage1_metrics <- read_csv("model_outputs/tsr_stage1_occurrence_metrics__rmse.csv")
-tsr_stage2_metrics <- read_csv("model_outputs/tsr_stage2_severity_metrics__rmse.csv")
+tsr_joint_opt <- read_csv("../../outputs/models/tsr_joint_optimization_results__rmse.csv")
+tsr_stage1_metrics <- read_csv("../../outputs/models/tsr_stage1_occurrence_metrics__rmse.csv")
+tsr_stage2_metrics <- read_csv("../../outputs/models/tsr_stage2_severity_metrics__rmse.csv")
 
 # Two-stage test results
-tsr_test_combined <- read_csv("model_outputs/two_stage_refined_test_combined__rmse.csv")
-tsr_test_occ <- read_csv("model_outputs/two_stage_refined_test_occ__rmse.csv")
-tsr_test_sev <- read_csv("model_outputs/two_stage_refined_test_sev__rmse.csv")
-tsr_test_predictions <- read_parquet("model_outputs/two_stage_refined_test_predictions__rmse.parquet")
+tsr_test_combined <- read_csv("../../outputs/models/two_stage_refined_test_combined__rmse.csv")
+tsr_test_occ <- read_csv("../../outputs/models/two_stage_refined_test_occ__rmse.csv")
+tsr_test_sev <- read_csv("../../outputs/models/two_stage_refined_test_sev__rmse.csv")
+tsr_test_predictions <- read_parquet("../../outputs/models/two_stage_refined_test_predictions__rmse.parquet")
 
 # Baseline comparisons
-sst_naive_val <- read_csv("model_outputs/sst_naive_baselines_validation.csv")
-sst_naive_test <- read_csv("model_outputs/sst_naive_baselines_test.csv")
-tsr_naive_combined <- read_csv("model_outputs/tsr_naive_combined_test.csv")
+sst_naive_val <- read_csv("../../outputs/models/sst_naive_baselines_validation.csv")
+sst_naive_test <- read_csv("../../outputs/models/sst_naive_baselines_test.csv")
+tsr_naive_combined <- read_csv("../../outputs/models/tsr_naive_combined_test.csv")
 
 # Calibration results
-tsr_calibration <- read_csv("model_outputs/tsr_stage1_calibration_results__rmse.csv")
-tsr_cal_curves <- read_csv("model_outputs/tsr_calibration_curves__rmse.csv")
+tsr_calibration <- read_csv("../../outputs/models/tsr_stage1_calibration_results__rmse.csv")
+tsr_cal_curves <- read_csv("../../outputs/models/tsr_calibration_curves__rmse.csv")
 
 # RMSE vs MAE comparison
-sst_val_summary_mae <- read_csv("model_outputs/sst_val_summary_mae.csv")
+sst_val_summary_mae <- read_csv("../../outputs/models/sst_val_summary_mae.csv")
 
 cat("Data loaded successfully.\n")
 cat("Single-stage models:", nrow(sst_val_summary), "\n")
@@ -202,8 +202,8 @@ fig1 <- (p1 | p2 | p3) + plot_layout(guides = "collect") & theme(legend.position
 print(fig1)
 
 # Save figure
-ggsave("plots/fig1_validation_all_models.png", fig1, width = 15, height = 8, dpi = 300)
-ggsave("plots/fig1_validation_all_models.pdf", fig1, width = 15, height = 8)
+ggsave("../../outputs/plots/fig1_validation_all_models.png", fig1, width = 15, height = 8, dpi = 300)
+ggsave("../../outputs/plots/fig1_validation_all_models.pdf", fig1, width = 15, height = 8)
 ```
 
 ## Figure 2: Test Performance - Best Models
@@ -277,8 +277,8 @@ fig2 <- (p_rmse | p_mae | p_rsq) + plot_layout(guides = "collect")
 print(fig2)
 
 # Save figure
-ggsave("plots/fig2_test_best_models.png", fig2, width = 15, height = 5, dpi = 300)
-ggsave("plots/fig2_test_best_models.pdf", fig2, width = 15, height = 5)
+ggsave("../../outputs/plots/fig2_test_best_models.png", fig2, width = 15, height = 5, dpi = 300)
+ggsave("../../outputs/plots/fig2_test_best_models.pdf", fig2, width = 15, height = 5)
 ```
 
 ## Figure 3: Non-Zero Week Performance (Apples-to-Apples)
@@ -399,8 +399,8 @@ fig3 <- ggplot(plot_data, aes(x = rmse, y = model_name, color = model_type, size
 print(fig3)
 
 # Save figure
-ggsave("plots/fig3_nonzero_performance.png", fig3, width = 12, height = 8, dpi = 300)
-ggsave("plots/fig3_nonzero_performance.pdf", fig3, width = 12, height = 8)
+ggsave("../../outputs/plots/fig3_nonzero_performance.png", fig3, width = 12, height = 8, dpi = 300)
+ggsave("../../outputs/plots/fig3_nonzero_performance.pdf", fig3, width = 12, height = 8)
 ```
 
 ## Figure 4: Predictions vs Actuals Time Series
@@ -541,14 +541,14 @@ fig4_combined
 print(fig4_combined)
 
 # Save combined figure
-ggsave("plots/fig4_combined.png", fig4_combined, width = 18, height = 7, dpi = 300)
-ggsave("plots/fig4_combined.pdf", fig4_combined, width = 18, height = 7)
+ggsave("../../outputs/plots/fig4_combined.png", fig4_combined, width = 18, height = 7, dpi = 300)
+ggsave("../../outputs/plots/fig4_combined.pdf", fig4_combined, width = 18, height = 7)
 
 # Also save individual panels for flexibility
-ggsave("plots/fig4a_time_series.png", fig4, width = 10, height = 6, dpi = 300)
-ggsave("plots/fig4a_time_series.pdf", fig4, width = 10, height = 6)
-ggsave("plots/fig4b_region_scatter.png", fig4b, width = 10, height = 6, dpi = 300)
-ggsave("plots/fig4b_region_scatter.pdf", fig4b, width = 10, height = 6)
+ggsave("../../outputs/plots/fig4a_time_series.png", fig4, width = 10, height = 6, dpi = 300)
+ggsave("../../outputs/plots/fig4a_time_series.pdf", fig4, width = 10, height = 6)
+ggsave("../../outputs/plots/fig4b_region_scatter.png", fig4b, width = 10, height = 6, dpi = 300)
+ggsave("../../outputs/plots/fig4b_region_scatter.pdf", fig4b, width = 10, height = 6)
 ```
 
 ## Figure 5: Feature Importance - Best Single-Stage Model
@@ -559,10 +559,10 @@ ggsave("plots/fig4b_region_scatter.pdf", fig4b, width = 10, height = 6)
 library(tidymodels)
 
 # Load the best fitted model
-best_model_fit <- readRDS("model_outputs/sst_best_fitted_model_rmse.rds")
+best_model_fit <- readRDS("../../outputs/models/sst_best_fitted_model_rmse.rds")
 
 # Load pretest data for standardization
-pretest_data <- read_parquet("data/analysis/adm_week_full.parquet") |>
+pretest_data <- read_parquet("../../data/analysis/adm_week_full.parquet") |>
   clean_names() |>
   filter(date < 19995)  # Test period starts September 29, 2024 (numeric date 19995)
 
@@ -680,8 +680,8 @@ fig5 <- ggplot(coef_df, aes(x = std_coef, y = feature_clean, fill = coef_sign)) 
 print(fig5)
 
 # Save figure
-ggsave("plots/fig5_feature_importance.png", fig5, width = 10, height = 8, dpi = 300)
-ggsave("plots/fig5_feature_importance.pdf", fig5, width = 10, height = 8)
+ggsave("../../outputs/plots/fig5_feature_importance.png", fig5, width = 10, height = 8, dpi = 300)
+ggsave("../../outputs/plots/fig5_feature_importance.pdf", fig5, width = 10, height = 8)
 ```
 
 ## Supplementary Figures
@@ -711,8 +711,8 @@ figS1 <- ggplot(all_baselines, aes(x = rmse, y = model, color = model_class)) +
 
 print(figS1)
 
-ggsave("plots/figS1_baseline_comparison.png", figS1, width = 10, height = 6, dpi = 300)
-ggsave("plots/figS1_baseline_comparison.pdf", figS1, width = 10, height = 6)
+ggsave("../../outputs/plots/figS1_baseline_comparison.png", figS1, width = 10, height = 6, dpi = 300)
+ggsave("../../outputs/plots/figS1_baseline_comparison.pdf", figS1, width = 10, height = 6)
 ```
 
 ### Figure S2: RMSE vs MAE Selection Robustness
@@ -756,8 +756,8 @@ figS2 <- ggplot(rmse_mae_comparison, aes(x = rmse, y = model_name, color = selec
 
 print(figS2)
 
-ggsave("plots/figS2_rmse_mae_comparison.png", figS2, width = 10, height = 6, dpi = 300)
-ggsave("plots/figS2_rmse_mae_comparison.pdf", figS2, width = 10, height = 6)
+ggsave("../../outputs/plots/figS2_rmse_mae_comparison.png", figS2, width = 10, height = 6, dpi = 300)
+ggsave("../../outputs/plots/figS2_rmse_mae_comparison.pdf", figS2, width = 10, height = 6)
 ```
 
 ### Figure S3: Calibration Assessment
@@ -780,8 +780,8 @@ if(nrow(tsr_cal_curves) > 0) {
   
   print(figS3)
   
-  ggsave("plots/figS3_calibration.png", figS3, width = 10, height = 6, dpi = 300)
-  ggsave("plots/figS3_calibration.pdf", figS3, width = 10, height = 6)
+  ggsave("../../outputs/plots/figS3_calibration.png", figS3, width = 10, height = 6, dpi = 300)
+  ggsave("../../outputs/plots/figS3_calibration.pdf", figS3, width = 10, height = 6)
 } else {
   cat("No calibration curve data available.\n")
 }
@@ -841,8 +841,8 @@ figS4 <- p_scatter | p_dist
 
 print(figS4)
 
-ggsave("plots/figS4_residuals.png", figS4, width = 15, height = 6, dpi = 300)
-ggsave("plots/figS4_residuals.pdf", figS4, width = 15, height = 6)
+ggsave("../../outputs/plots/figS4_residuals.png", figS4, width = 15, height = 6, dpi = 300)
+ggsave("../../outputs/plots/figS4_residuals.pdf", figS4, width = 15, height = 6)
 ```
 
 ### Figure S6: Two-Stage Model Decomposition
@@ -888,8 +888,8 @@ fig5 <- (p_occurrence | p_severity | p_combined)
 print(fig5)
 
 # Save figure
-ggsave("plots/fig6_decomposition.png", fig5, width = 15, height = 5, dpi = 300)
-ggsave("plots/fig6_decomposition.pdf", fig5, width = 15, height = 5)
+ggsave("../../outputs/plots/fig6_decomposition.png", fig5, width = 15, height = 5, dpi = 300)
+ggsave("../../outputs/plots/fig6_decomposition.pdf", fig5, width = 15, height = 5)
 ```
 
 ### Figure S7: Zero vs Non-Zero Performance Stratification
@@ -931,6 +931,6 @@ fig6 <- p_stratified_rmse | p_stratified_mae
 print(fig6)
 
 # Save figure
-ggsave("plots/fig7_zero_nonz_zero.png", fig6, width = 10, height = 5, dpi = 300)
-ggsave("plots/fig7_zero_nonz_zero.pdf", fig6, width = 10, height = 5)
+ggsave("../../outputs/plots/fig7_zero_nonz_zero.png", fig6, width = 10, height = 5, dpi = 300)
+ggsave("../../outputs/plots/fig7_zero_nonz_zero.pdf", fig6, width = 10, height = 5)
 ```
