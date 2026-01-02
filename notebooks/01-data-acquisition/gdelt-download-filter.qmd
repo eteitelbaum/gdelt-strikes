@@ -51,14 +51,14 @@ job <- bq_project_query(project_id, sql)
 all_strikes_data <- bq_table_download(job, bigint = "character")
 
 # Save as a parquet file
-write_parquet(all_strikes_data, "data/raw/gdelt_strikes.parquet")
+write_parquet(all_strikes_data, "../../data/raw/gdelt_strikes.parquet")
 ```
 
 This gives us 492,500 rows of data. Next, let's filter the strikes data to keep only those with genuine ADM1 codes (regional detail) and save the filtered data as a parquet file.
 
 ```{r}
 # load the raw strikes data
-all_strikes_data <- read_parquet("data/raw/gdelt_strikes.parquet")
+all_strikes_data <- read_parquet("../../data/raw/gdelt_strikes.parquet")
 
 gdelt_strikes_filtered <- all_strikes_data |>
   # Keep only strikes with genuine ADM1 codes (regional detail)
@@ -71,7 +71,7 @@ gdelt_strikes_filtered <- all_strikes_data |>
 glimpse(gdelt_strikes_filtered)
 
 # Save as a parquet file
-write_parquet(gdelt_strikes_filtered, "data/raw/gdelt_strikes_filtered.parquet")
+write_parquet(gdelt_strikes_filtered, "../../data/raw/gdelt_strikes_filtered.parquet")
 ```
 
 This filtering step reduces the dataset to 328,982 rows. We can see from the URLs that there is a lot of irrelevant content, so we will take some steps to filter the data down to more relevant articles. Our first step will be to filter by Confidence score from the `eventmentions` table. The Confidence score is a measure of how relevant the article is to the event, specifically how many NLP steps had to be taken to extract the event info from a given article. The score ranges from 10 to 100 with higher scores indicating greater relevance. We will use a threshold of 80 to filter the data.
@@ -84,7 +84,7 @@ Let's start by creating a table of event ids from the strikes data and uploading
 #| label: create-strike-ids-table
 
 # Load events parquet
-#gdelt_strikes_filtered <- read_parquet("data/raw/gdelt_strikes_filtered.parquet")
+#gdelt_strikes_filtered <- read_parquet("../../data/raw/gdelt_strikes_filtered.parquet")
 
 # Keep only distinct GKGRECORDIDs
 strike_ids <- gdelt_strikes_filtered |>
@@ -151,7 +151,7 @@ gdelt_strikes_event_mentions <- bq_table_download(event_mentions_job, bigint = "
 
 glimpse(gdelt_strikes_event_mentions)
 
-write_parquet(gdelt_strikes_event_mentions, "data/raw/gdelt_strikes_event_mentions.parquet")
+write_parquet(gdelt_strikes_event_mentions, "../../data/raw/gdelt_strikes_event_mentions.parquet")
 ```
 
 Now let's do an inner join to keep only those strikes events that have high confidence mentions.
@@ -160,10 +160,10 @@ Now let's do an inner join to keep only those strikes events that have high conf
 #| label: join-strikes-eventmentions
 
 # Load the filtered strikes data
-gdelt_strikes_filtered <- read_parquet("data/raw/gdelt_strikes_filtered.parquet")
+gdelt_strikes_filtered <- read_parquet("../../data/raw/gdelt_strikes_filtered.parquet")
 
 # Load the event mentions data
-gdelt_strikes_event_mentions <- read_parquet("data/raw/gdelt_strikes_event_mentions.parquet")
+gdelt_strikes_event_mentions <- read_parquet("../../data/raw/gdelt_strikes_event_mentions.parquet")
 
 # Inner join to keep only strikes with high confidence mentions
 gdelt_strikes_hiconf <- inner_join(
@@ -173,7 +173,7 @@ gdelt_strikes_hiconf <- inner_join(
   )
 
 # Save as a parquet file
-write_parquet(gdelt_strikes_hiconf, "data/raw/gdelt_strikes_hiconf.parquet")
+write_parquet(gdelt_strikes_hiconf, "../../data/raw/gdelt_strikes_hiconf.parquet")
 
 glimpse(gdelt_strikes_hiconf)
 ```
@@ -198,7 +198,7 @@ First let's create a table of event ids from the high confidence strikes data an
 library(bit64)  # for integer64 type
 
 # Load the hi confidence strikes data
-#gdelt_strikes_hiconf <- read_parquet("data/raw/gdelt_strikes_hiconf.parquet")
+#gdelt_strikes_hiconf <- read_parquet("../../data/raw/gdelt_strikes_hiconf.parquet")
 
 # Keep only distinct GKGRECORDIDs
 strike_ids_hiconf <- gdelt_strikes_hiconf |>
@@ -366,18 +366,18 @@ bq_table_save(
 
 # Open the sharded dataset locally (NOT gs:// anymore)
 files <- c(
-  "data/raw/strike_event_gkg-000000000000.parquet", 
-  "data/raw/strike_event_gkg-000000000001.parquet"
+  "../../data/raw/strike_event_gkg-000000000000.parquet", 
+  "../../data/raw/strike_event_gkg-000000000001.parquet"
 )
 ds <- open_dataset(files, format = "parquet")
 
 
 # Collect and write as a single local Parquet file
 strike_event_gkg <- ds %>% collect()
-write_parquet(strike_event_gkg, "data/raw/strike_event_gkg.parquet")
+write_parquet(strike_event_gkg, "../../data/raw/strike_event_gkg.parquet")
 
 # Reload the single file later
-gdelt_strikes_gkg <- read_parquet("data/raw/strike_event_gkg.parquet")
+gdelt_strikes_gkg <- read_parquet("../../data/raw/strike_event_gkg.parquet")
 
 glimpse(gdelt_strikes_gkg)
 ```
@@ -388,10 +388,10 @@ Now as a final step, let's join our filtered GKG data back to our high confidenc
 #| label: final-join-strikes-gkg
 
 # Load strikes (events table with metadata)
-gdelt_strikes_hiconf <- read_parquet("data/raw/gdelt_strikes_hiconf.parquet")
+gdelt_strikes_hiconf <- read_parquet("../../data/raw/gdelt_strikes_hiconf.parquet")
 
 # Load enrichment (event-level GKG aggregation)
-gdelt_strikes_gkg <- read_parquet("data/raw/strike_event_gkg.parquet") |>
+gdelt_strikes_gkg <- read_parquet("../../data/raw/strike_event_gkg.parquet") |>
   #change GLOBALEVENTID to character to match strikes data
   mutate(GLOBALEVENTID = as.character(GLOBALEVENTID))
 
@@ -400,7 +400,7 @@ gdelt_strikes_enriched <- gdelt_strikes_hiconf |>
   left_join(gdelt_strikes_gkg, by = "GLOBALEVENTID")
 
 # Save enriched dataset
-write_parquet(gdelt_strikes_enriched, "data/enhanced/gdelt_strikes_enriched.parquet")
+write_parquet(gdelt_strikes_enriched, "../../data/enhanced/gdelt_strikes_enriched.parquet")
 
 glimpse(gdelt_strikes_enriched)
 ```
@@ -409,7 +409,7 @@ glimpse(gdelt_strikes_enriched)
 
 ```{r}
 # 1) Load your parquet
-gdelt_strikes_enriched <- read_parquet("data/enhanced/gdelt_strikes_enriched.parquet")
+gdelt_strikes_enriched <- read_parquet("../../data/enhanced/gdelt_strikes_enriched.parquet")
 
 # 2) Explode themes into long format, drop offsets
 themes_long <- gdelt_strikes_enriched |>

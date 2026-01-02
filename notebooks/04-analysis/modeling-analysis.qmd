@@ -43,7 +43,7 @@ ctrl_race <- NULL
 ```{r}
 #| label: load-data
 
-adm_full <- read_parquet("data/analysis/adm_week_full.parquet") |>
+adm_full <- read_parquet("../../data/analysis/adm_week_full.parquet") |>
   clean_names()
 
 glimpse(adm_full)
@@ -607,14 +607,14 @@ print(list(zero = naive_zero, lag1 = naive_lag1, roll4 = naive_roll4))
 dir.create("model_outputs", showWarnings = FALSE)
 
 # 1) Validation summaries and per-fold metrics
-readr::write_csv(val_summary, "model_outputs/two_stage_val_summary.csv")
+readr::write_csv(val_summary, "../../outputs/models/two_stage_val_summary.csv")
 
 val_folds_tbl <- bind_rows(pipeline_results, .id = "pipeline")
-readr::write_csv(val_folds_tbl, "model_outputs/two_stage_val_folds.csv")
+readr::write_csv(val_folds_tbl, "../../outputs/models/two_stage_val_folds.csv")
 
 # 2) Final model objects
-saveRDS(final_clf_fit, "model_outputs/two_stage_final_classifier.rds")
-saveRDS(final_reg_fit, "model_outputs/two_stage_final_regressor.rds")
+saveRDS(final_clf_fit, "../../outputs/models/two_stage_final_classifier.rds")
+saveRDS(final_reg_fit, "../../outputs/models/two_stage_final_regressor.rds")
 
 # 3) Test predictions and metrics
 test_predictions_tbl <- test_df |>
@@ -623,14 +623,14 @@ test_predictions_tbl <- test_df |>
          sev_hat = test_sev_hat,
          expected_count = prob_yes * sev_hat)
 
-arrow::write_parquet(test_predictions_tbl, "model_outputs/two_stage_test_predictions.parquet")
+arrow::write_parquet(test_predictions_tbl, "../../outputs/models/two_stage_test_predictions.parquet")
 
 test_metrics_tbl <- bind_rows(
   test_occ |> mutate(stage = "occurrence"),
   test_sev |> mutate(stage = "severity_positive"),
   test_combined |> mutate(stage = "combined_all")
 )
-readr::write_csv(test_metrics_tbl, "model_outputs/two_stage_test_metrics.csv")
+readr::write_csv(test_metrics_tbl, "../../outputs/models/two_stage_test_metrics.csv")
 
 # 4) Best pipeline record
 best_info <- tibble(
@@ -638,11 +638,11 @@ best_info <- tibble(
   classifier = best_clf_name,
   regressor = best_reg_name
 )
-readr::write_csv(best_info, "model_outputs/two_stage_best_pipeline.csv")
+readr::write_csv(best_info, "../../outputs/models/two_stage_best_pipeline.csv")
 
 # 5) Save tuned threshold
 thr_tbl <- tibble(classifier = best_clf_name, tuned_threshold = best_threshold)
-readr::write_csv(thr_tbl, "model_outputs/two_stage_tuned_threshold.csv")
+readr::write_csv(thr_tbl, "../../outputs/models/two_stage_tuned_threshold.csv")
 
 # 6) Save naive baselines
 naive_tbl <- tibble(
@@ -651,7 +651,7 @@ naive_tbl <- tibble(
   rmse = c(naive_zero$.estimate[2], naive_lag1$.estimate[2], naive_roll4$.estimate[2]),
   rsq = c(naive_zero$.estimate[3], naive_lag1$.estimate[3], naive_roll4$.estimate[3])
 )
-readr::write_csv(naive_tbl, "model_outputs/two_stage_naive_baselines.csv")
+readr::write_csv(naive_tbl, "../../outputs/models/two_stage_naive_baselines.csv")
 
 # 7) Save compact RDS summary of validation and final test results
 results_rds <- list(
@@ -664,7 +664,7 @@ results_rds <- list(
     combined_all = test_combined
   )
 )
-saveRDS(results_rds, "model_outputs/two_stage_results_summary.rds")
+saveRDS(results_rds, "../../outputs/models/two_stage_results_summary.rds")
 ```
 
 ## Feature importance for final models
@@ -680,10 +680,10 @@ clf_vip_plot <- try(vip::vip(clf_engine, num_features = 20), silent = TRUE)
 reg_vip_plot <- try(vip::vip(reg_engine, num_features = 20), silent = TRUE)
 
 if (!inherits(clf_vip_plot, "try-error")) {
-  ggsave("model_outputs/two_stage_feature_importance_classifier.png", clf_vip_plot, width = 9, height = 6, dpi = 300)
+  ggsave("../../outputs/models/two_stage_feature_importance_classifier.png", clf_vip_plot, width = 9, height = 6, dpi = 300)
 }
 if (!inherits(reg_vip_plot, "try-error")) {
-  ggsave("model_outputs/two_stage_feature_importance_regressor.png", reg_vip_plot, width = 9, height = 6, dpi = 300)
+  ggsave("../../outputs/models/two_stage_feature_importance_regressor.png", reg_vip_plot, width = 9, height = 6, dpi = 300)
 }
 ```
 
@@ -731,7 +731,7 @@ single_results <- imap_dfr(single_wfs, single_fit_predict)
 print(single_results)
 
 # Save appendix results
-readr::write_csv(single_results, "model_outputs/single_stage_results.csv")
+readr::write_csv(single_results, "../../outputs/models/single_stage_results.csv")
 ```
 
 

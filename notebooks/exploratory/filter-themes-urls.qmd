@@ -18,7 +18,7 @@ library(arrow)
 
 ```{r}
 # Load the enriched GDELT dataset with themes
-gdelt_strikes_enriched <- read_parquet("data/enhanced/gdelt_strikes_enriched.parquet")
+gdelt_strikes_enriched <- read_parquet("../../data/enhanced/gdelt_strikes_enriched.parquet")
 
 # Explode themes into long format, drop offsets
 themes_long <- gdelt_strikes_enriched |>
@@ -108,7 +108,7 @@ gdelt_strikes <- gdelt_strikes_enriched |>
     filter(str_detect(all_themes, "STRIKE"))
 
 # Save to Parquet
-write_parquet(gdelt_strikes, "data/enhanced/gdelt_strikes.parquet")
+write_parquet(gdelt_strikes, "../../data/enhanced/gdelt_strikes.parquet")
 ```
 
 

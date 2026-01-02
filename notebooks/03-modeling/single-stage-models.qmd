@@ -46,7 +46,7 @@ plan(multisession, workers = 4)
 options(future.globals.maxSize = 8 * 1024^3)
 
 # Load helper functions
-source("helpers/helpers.R")
+source("../../helpers/helpers.R")
 
 # Prediction capping controls
 cap_predictions <- FALSE   # set TRUE to enable winsorization
@@ -65,7 +65,7 @@ perm_importance_nsim <- 5
 ```{r}
 #| label: data
 
-adm_full <- read_parquet("data/analysis/adm_week_full.parquet") |>
+adm_full <- read_parquet("../../data/analysis/adm_week_full.parquet") |>
   clean_names()
 
 predictor_cols <- adm_full |>
@@ -321,7 +321,7 @@ if ("glmnet_log" %in% models_to_run) {
   tuned_glmnet_log <- tune_grid(wf_glmnet_log, resamples = val_resamples, grid = grid_glmnet, metrics = reg_metrics, control = ctrl_grid)
   # Persist tuning metrics and report evaluated counts
   met_glmnet_log <- collect_metrics(tuned_glmnet_log)
-  readr::write_csv(met_glmnet_log, sprintf("model_outputs/sst_tuning_metrics_glmnet_log__%s.csv", selection_metric))
+  readr::write_csv(met_glmnet_log, sprintf("../../outputs/models/sst_tuning_metrics_glmnet_log__%s.csv", selection_metric))
   cat(" Post-tuning check - unique configs evaluated:", length(unique(met_glmnet_log$.config)), "of", nrow(grid_glmnet), "\n")
   # Finalize workflow
   final_glmnet_log <- finalize_workflow(wf_glmnet_log, select_best(tuned_glmnet_log, metric = selection_metric))
@@ -356,7 +356,7 @@ if ("lgbm_poi" %in% models_to_run) {
   tuned_lgbm_poi <- tune_grid(wf_lgbm_poi, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
   # Persist tuning metrics and report evaluated counts
   met_lgbm_poi <- collect_metrics(tuned_lgbm_poi)
-  readr::write_csv(met_lgbm_poi, sprintf("model_outputs/sst_tuning_metrics_lgbm_poi__%s.csv", selection_metric))
+  readr::write_csv(met_lgbm_poi, sprintf("../../outputs/models/sst_tuning_metrics_lgbm_poi__%s.csv", selection_metric))
   cat(" Post-tuning check - unique configs evaluated:", length(unique(met_lgbm_poi$.config)), "of", nrow(grid_boosted), "\n")
   # Finalize workflow
   final_lgbm_poi <- finalize_workflow(wf_lgbm_poi, select_best(tuned_lgbm_poi, metric = selection_metric))
@@ -390,7 +390,7 @@ if ("lgbm_twd" %in% models_to_run) {
   tuned_lgbm_twd <- tune_grid(wf_lgbm_twd, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
   # Persist tuning metrics and report evaluated counts
   met_lgbm_twd <- collect_metrics(tuned_lgbm_twd)
-  readr::write_csv(met_lgbm_twd, sprintf("model_outputs/sst_tuning_metrics_lgbm_twd__%s.csv", selection_metric))
+  readr::write_csv(met_lgbm_twd, sprintf("../../outputs/models/sst_tuning_metrics_lgbm_twd__%s.csv", selection_metric))
   cat(" Post-tuning check - unique configs evaluated:", length(unique(met_lgbm_twd$.config)), "of", nrow(grid_boosted), "\n")
   # Finalize workflow
     final_lgbm_twd <- finalize_workflow(wf_lgbm_twd, select_best(tuned_lgbm_twd, metric = selection_metric))
@@ -424,7 +424,7 @@ if ("lgbm_log" %in% models_to_run) {
   tuned_lgbm_log <- tune_grid(wf_lgbm_log, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
   # Persist tuning metrics and report evaluated counts
   met_lgbm_log <- collect_metrics(tuned_lgbm_log)
-  readr::write_csv(met_lgbm_log, sprintf("model_outputs/sst_tuning_metrics_lgbm_log__%s.csv", selection_metric))
+  readr::write_csv(met_lgbm_log, sprintf("../../outputs/models/sst_tuning_metrics_lgbm_log__%s.csv", selection_metric))
   cat(" Post-tuning check - unique configs evaluated:", length(unique(met_lgbm_log$.config)), "of", nrow(grid_boosted), "\n")
   # Finalize workflow
   final_lgbm_log <- finalize_workflow(wf_lgbm_log, select_best(tuned_lgbm_log, metric = selection_metric))
@@ -459,7 +459,7 @@ if ("xgb_poi" %in% models_to_run) {
   tuned_xgb_poi <- tune_grid(wf_xgb_poi, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
   # Persist tuning metrics and report evaluated counts
   met_xgb_poi <- collect_metrics(tuned_xgb_poi)
-  readr::write_csv(met_xgb_poi, sprintf("model_outputs/sst_tuning_metrics_xgb_poi__%s.csv", selection_metric))
+  readr::write_csv(met_xgb_poi, sprintf("../../outputs/models/sst_tuning_metrics_xgb_poi__%s.csv", selection_metric))
   cat(" Post-tuning check - unique configs evaluated:", length(unique(met_xgb_poi$.config)), "of", nrow(grid_boosted), "\n")
   # Finalize workflow
   final_xgb_poi <- finalize_workflow(wf_xgb_poi, select_best(tuned_xgb_poi, metric = selection_metric))
@@ -493,7 +493,7 @@ if ("xgb_log" %in% models_to_run) {
   tuned_xgb_log <- tune_grid(wf_xgb_log, resamples = val_resamples, grid = grid_boosted, metrics = reg_metrics, control = ctrl_grid)
   # Persist tuning metrics and report evaluated counts
   met_xgb_log <- collect_metrics(tuned_xgb_log)
-  readr::write_csv(met_xgb_log, sprintf("model_outputs/sst_tuning_metrics_xgb_log__%s.csv", selection_metric))
+  readr::write_csv(met_xgb_log, sprintf("../../outputs/models/sst_tuning_metrics_xgb_log__%s.csv", selection_metric))
   cat(" Post-tuning check - unique configs evaluated:", length(unique(met_xgb_log$.config)), "of", nrow(grid_boosted), "\n")
   # Finalize workflow
   final_xgb_log <- finalize_workflow(wf_xgb_log, select_best(tuned_xgb_log, metric = selection_metric))
@@ -537,11 +537,11 @@ if (length(val_results) > 0) {
 }
 
 # Save validation results for later analysis (metric-aware filenames)
-readr::write_csv(val_results, sprintf("model_outputs/sst_val_results_detailed_%s.csv", selection_metric))
-readr::write_csv(val_summary, sprintf("model_outputs/sst_val_summary_%s.csv", selection_metric))
+readr::write_csv(val_results, sprintf("../../outputs/models/sst_val_results_detailed_%s.csv", selection_metric))
+readr::write_csv(val_summary, sprintf("../../outputs/models/sst_val_summary_%s.csv", selection_metric))
 
 # Save all fitted models for later analysis
-saveRDS(fitted_models, sprintf("model_outputs/sst_all_fitted_models_%s.rds", selection_metric))
+saveRDS(fitted_models, sprintf("../../outputs/models/sst_all_fitted_models_%s.rds", selection_metric))
 
 # record end time and print elapsed time
 end_time <- Sys.time()
@@ -611,7 +611,7 @@ if (length(val_predictions) > 0) {
   cat("\n[Validation] Zero/Non-zero and supplementary metrics by model:\n")
   print(val_separate_metrics, n = 24)
   
-  readr::write_csv(val_separate_metrics, sprintf("model_outputs/sst_val_separate_metrics_%s.csv", selection_metric))
+  readr::write_csv(val_separate_metrics, sprintf("../../outputs/models/sst_val_separate_metrics_%s.csv", selection_metric))
 } else {
   cat("\n[Validation] No predictions saved.")
 }
@@ -696,14 +696,14 @@ if (best_model %in% c("lm_log", "lgbm_log", "xgb_log")) {
 cat("\n Test metrics (original scale):\n"); print(test_tbl)
 
 # Save outputs for later analysis
-arrow::write_parquet(tibble(date = test_df$date, .pred = test_pred), sprintf("model_outputs/sst_predictions__%s.parquet", selection_metric))
+arrow::write_parquet(tibble(date = test_df$date, .pred = test_pred), sprintf("../../outputs/models/sst_predictions__%s.parquet", selection_metric))
 
 # Combine standard and supplementary metrics for saving
 all_test_metrics <- bind_rows(test_tbl, supplementary_metrics)
-readr::write_csv(all_test_metrics, sprintf("model_outputs/sst_metrics_%s.csv", selection_metric))
+readr::write_csv(all_test_metrics, sprintf("../../outputs/models/sst_metrics_%s.csv", selection_metric))
 
 # Save the fitted model for variable importance analysis
-saveRDS(final_fit, sprintf("model_outputs/sst_best_fitted_model_%s.rds", selection_metric))
+saveRDS(final_fit, sprintf("../../outputs/models/sst_best_fitted_model_%s.rds", selection_metric))
 
 # Also save model metadata for reference
 model_metadata <- tibble(
@@ -725,7 +725,7 @@ if (nrow(supplementary_metrics) > 0) {
   }
 }
 
-readr::write_csv(model_metadata, sprintf("model_outputs/sst_model_metadata_%s.csv", selection_metric))
+readr::write_csv(model_metadata, sprintf("../../outputs/models/sst_model_metadata_%s.csv", selection_metric))
 ```
 
 ## Test Set: Zero vs Non-Zero Metrics
@@ -764,7 +764,7 @@ test_separate_metrics <- bind_rows(
 cat("\n[Test] Zero/Non-zero metrics on held-out test set:\n")
 print(test_separate_metrics)
 
-readr::write_csv(test_separate_metrics, sprintf("model_outputs/sst_test_separate_metrics_%s.csv", selection_metric))
+readr::write_csv(test_separate_metrics, sprintf("../../outputs/models/sst_test_separate_metrics_%s.csv", selection_metric))
 ```
 
 ## Feature Importance For Best Model (if applicable)
@@ -781,7 +781,7 @@ if (best_model %in% c("lgbm_poi", "lgbm_log", "lgbm_twd", "xgb_poi", "xgb_log"))
     mutate(model = best_model)
   
   # Save importance scores
-  arrow::write_parquet(importance_df, sprintf("model_outputs/sst_feature_importance_%s.parquet", selection_metric))
+  arrow::write_parquet(importance_df, sprintf("../../outputs/models/sst_feature_importance_%s.parquet", selection_metric))
   
   # Print top 10
   cat("\n Top 10 most important features:\n")
@@ -859,7 +859,7 @@ cat("\n[Naive Baselines] Validation set results (ranked by RMSE):\n")
 print(naive_val_summary)
 
 # Save validation baseline results (metric-agnostic filename)
-readr::write_csv(naive_val_summary, "model_outputs/sst_naive_baselines_validation.csv")
+readr::write_csv(naive_val_summary, "../../outputs/models/sst_naive_baselines_validation.csv")
 
 # Save validation baseline results only (comparison tables will be created later)
 cat("\n[Naive Baselines] Validation baselines saved. Comparison tables will be created during writeup.\n")
@@ -935,7 +935,7 @@ cat("\n[Naive Baselines] Test set results (ranked by RMSE):\n")
 print(naive_test_summary)
 
 # Save test baseline results (metric-agnostic filename)
-readr::write_csv(naive_test_summary, "model_outputs/sst_naive_baselines_test.csv")
+readr::write_csv(naive_test_summary, "../../outputs/models/sst_naive_baselines_test.csv")
 
 # Save test baseline results only (comparison tables will be created later)
 cat("\n[Naive Baselines] Test baselines saved. Comparison tables will be created during writeup.\n")

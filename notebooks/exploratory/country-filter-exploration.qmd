@@ -20,7 +20,7 @@ library(janitor)
 ```{r}
 #| label: load-data
 
-adm_full <- read_parquet("data/analysis/adm_week_full.parquet") |>
+adm_full <- read_parquet("../../data/analysis/adm_week_full.parquet") |>
   clean_names() |>
   mutate(date = as.Date(date)) |>
   select(date, strike_count, action_geo_country_code, action_geo_adm1_code) |>

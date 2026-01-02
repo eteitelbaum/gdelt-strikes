@@ -7,9 +7,8 @@
 # Large data files and directories
 data/
 gadm-boundaries/
-model_outputs/
-model-outputs/
-plots/
+outputs/
+archive/
 
 # Service account credentials
 service-account.json
