@@ -52,7 +52,7 @@ paths <- list(
 )
 
 # Source helpers kept in repo
-helpers_path <- file.path(root, "papers/nyu-sds-conf/helpers/presi_helpers.R")
+helpers_path <- file.path(root, "helpers/helpers.R")
 if (file.exists(helpers_path)) source(helpers_path)
 
 # Preload only datasets needed for illustrative URL samples
@@ -925,9 +925,9 @@ model_colors <- c(
 )
 
 # Load data
-sst_val_summary <- read_csv(file.path(root, "model_outputs/sst_val_summary_rmse.csv"), show_col_types = FALSE)
-tsr_joint_opt <- read_csv(file.path(root, "model_outputs/tsr_joint_optimization_results__rmse.csv"), show_col_types = FALSE)
-sst_naive_val <- read_csv(file.path(root, "model_outputs/sst_naive_baselines_validation.csv"), show_col_types = FALSE)
+sst_val_summary <- read_csv(file.path(root, "outputs/models/sst_val_summary_rmse.csv"), show_col_types = FALSE)
+tsr_joint_opt <- read_csv(file.path(root, "outputs/models/tsr_joint_optimization_results__rmse.csv"), show_col_types = FALSE)
+sst_naive_val <- read_csv(file.path(root, "outputs/models/sst_naive_baselines_validation.csv"), show_col_types = FALSE)
 
 # Prepare single-stage data
 sst_val_plot <- sst_val_summary |>
@@ -1088,8 +1088,8 @@ p3 <- ggplot(val_comparison, aes(x = rsq, y = model_name, color = model_type, si
 #| fig-height: 6
 
 # Load data
-sst_val_separate <- read_csv(file.path(root, "model_outputs/sst_val_separate_metrics_rmse.csv"), show_col_types = FALSE)
-tsr_stage2_metrics <- read_csv(file.path(root, "model_outputs/tsr_stage2_severity_metrics__rmse.csv"), show_col_types = FALSE)
+sst_val_separate <- read_csv(file.path(root, "outputs/models/sst_val_separate_metrics_rmse.csv"), show_col_types = FALSE)
+tsr_stage2_metrics <- read_csv(file.path(root, "outputs/models/tsr_stage2_severity_metrics__rmse.csv"), show_col_types = FALSE)
 
 # All models list
 all_models <- c(
@@ -1206,9 +1206,9 @@ ggplot(plot_data, aes(x = rmse, y = model_name, color = model_type, size = selec
 #| fig-align: center
 
 # Load test data
-sst_model_metadata <- read_csv(file.path(root, "model_outputs/sst_model_metadata_rmse.csv"), show_col_types = FALSE)
-tsr_test_combined <- read_csv(file.path(root, "model_outputs/two_stage_refined_test_combined__rmse.csv"), show_col_types = FALSE)
-sst_naive_test <- read_csv(file.path(root, "model_outputs/sst_naive_baselines_test.csv"), show_col_types = FALSE)
+sst_model_metadata <- read_csv(file.path(root, "outputs/models/sst_model_metadata_rmse.csv"), show_col_types = FALSE)
+tsr_test_combined <- read_csv(file.path(root, "outputs/models/two_stage_refined_test_combined__rmse.csv"), show_col_types = FALSE)
+sst_naive_test <- read_csv(file.path(root, "outputs/models/sst_naive_baselines_test.csv"), show_col_types = FALSE)
 
 # Prepare data
 best_models <- tibble(
@@ -1286,8 +1286,8 @@ p_rsq <- ggplot(best_models, aes(x = model_name, y = rsq, fill = dataset)) +
 #| fig-height: 7
 
 # Load data
-tsr_test_predictions <- read_parquet(file.path(root, "model_outputs/two_stage_refined_test_predictions__rmse.parquet"))
-sst_predictions <- read_parquet(file.path(root, "model_outputs/sst_predictions__rmse.parquet"))
+tsr_test_predictions <- read_parquet(file.path(root, "outputs/models/two_stage_refined_test_predictions__rmse.parquet"))
+sst_predictions <- read_parquet(file.path(root, "outputs/models/sst_predictions__rmse.parquet"))
 
 # Aggregate to weekly totals
 weekly_tsr <- tsr_test_predictions |>
@@ -1381,7 +1381,7 @@ library(tidymodels)
 library(vip)
 
 # Load model
-best_model_fit <- readRDS(file.path(root, "model_outputs/sst_best_fitted_model_rmse.rds"))
+best_model_fit <- readRDS(file.path(root, "outputs/models/sst_best_fitted_model_rmse.rds"))
 
 # Extract feature importance from LightGBM Tweedie model
 importance_df <- vip::vi_model(best_model_fit) |>
