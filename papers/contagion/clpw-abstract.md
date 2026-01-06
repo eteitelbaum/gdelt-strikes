@@ -1,0 +1,17 @@
+# The Spatial Diffusion of Labor Strikes: Evidence from Global Subnational Event Data
+
+**Conference**: Sixth Annual Comparative Labor Politics Workshop
+**Date**: March 27, 2026
+**Author**: Emmanuel Teitelbaum
+
+## Abstract
+
+Theoretical work on social movement mobilization emphasizes demonstration effects and opportunity structures, yet quantitative research on labor strike diffusion has rarely employed identification strategies that distinguish genuine contagion from common shocks or shared underlying conditions. While historical and qualitative studies document strike waves and regional clustering, establishing whether strikes in one location causally influence mobilization elsewhere remains an open empirical question. 
+
+This paper examines the spatial diffusion of strike activity using global event data and subnational panel methods. We construct a subnational panel of first-level administrative units observed weekly across 181 countries using labor strike events from the Global Database of Events, Language and Tone (GDELT) for the period 2015-2025. We geocode approximately 30,000 strike events to subnational administrative (ADM1) boundaries and define neighbor relationships based on shared borders. 
+
+Our core research question asks whether strikes in nearby subnational units increase the probability of subsequent strike onset in focal units, and whether this diffusion is conditioned by national political and labor institutions. We theorize that exposure to nearby strike activity generates demonstration effects that lower mobilization costs and signal the viability of collective action. However, we expect these diffusion dynamics to be filtered through institutional contexts: freedom of expression may amplify information flows about nearby strikes; freedom of association may facilitate organizational coordination in response to nearby mobilization; and state repression may suppress the translation of nearby strike signals into local action.
+
+To identify diffusion effects, we employ a two-way fixed effects panel design with administrative unit fixed effects and country-by-week fixed effects. This specification addresses both time-invariant unit-level confounders and national-level shocks that might generate spurious spatial correlation. Our primary exposure measure is a binary indicator for whether at least one strike occurred in a geographically adjacent subnational unit within the prior two weeks, focusing on within-country neighbors to hold institutional context constant. We then test institutional moderation hypotheses using time-varying measures of political freedoms and repression from the Varieties of Democracy (V-Dem) project.
+
+This research contributes to three literatures. First, it adapts identification strategies from the conflict contagion literature—particularly work on subnational civil conflict spillovers—to labor mobilization. Second, it brings causal inference methods to the study of protest diffusion, a field dominated by weaker observational designs. Third, it provides new empirical evidence on how institutions shape collective action dynamics, testing core propositions from political opportunity structure theory with improved identification.

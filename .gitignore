@@ -9,9 +9,13 @@ data/
 gadm-boundaries/
 outputs/
 archive/
+literature/
 
 # Service account credentials
 service-account.json
 
 # System files
 .DS_Store
+
+# Notes
+notes/
