@@ -174,7 +174,7 @@ def main():
     parser = argparse.ArgumentParser(description="Classify GDELT strike URLs via OpenAI Batch API.")
     group = parser.add_mutually_exclusive_group(required=True)
     # Pass 1
-    group.add_argument("--prepare",       nargs="?", const=None, metavar="N",
+    group.add_argument("--prepare",       nargs="?", const="all", metavar="N",
                        help="Build pass1 batch JSONL (optionally limit to N events).")
     group.add_argument("--submit",        action="store_true", help="Submit pass1 batch.")
     group.add_argument("--status",        action="store_true", help="Check pass1 batch status.")
@@ -194,10 +194,10 @@ def main():
 
     wayback = not args.no_wayback
 
-    if args.prepare is not None:
-        prepare_batch(sample=int(args.prepare))
-    elif args.prepare is None and "--prepare" in sys.argv:
+    if args.prepare == "all":
         prepare_batch()
+    elif args.prepare is not None:
+        prepare_batch(sample=int(args.prepare))
     elif args.submit:
         submit_batch()
     elif args.status:

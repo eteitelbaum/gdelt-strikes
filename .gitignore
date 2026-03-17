@@ -21,7 +21,8 @@ __pycache__/
 *.pyc
 
 # URL classification intermediary files
-tools/url_classifier/batch_requests.jsonl
+tools/url_classifier/batch_requests*.jsonl
+tools/url_classifier/batch_plan.json
 tools/url_classifier/batch_results.jsonl
 tools/url_classifier/batch_meta.json
 tools/url_classifier/pass2_batch_requests.jsonl
