@@ -20,6 +20,9 @@ from .prompts import (
 MODEL       = "gpt-4o-mini"
 PASS2_MODEL = "gpt-4o-mini"
 
+# Max requests per batch chunk — keeps files well under OpenAI's 200 MB limit
+CHUNK_SIZE  = 10_000   # ~17.8M tokens/chunk, under OpenAI's 20M enqueued-token limit
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -47,7 +50,13 @@ def parse_result_line(line: str) -> dict | None:
 # Pass 1
 # ---------------------------------------------------------------------------
 
+def _chunk_path(i: int) -> "Path":
+    from .data import BATCH_DIR
+    return BATCH_DIR / f"batch_requests_{i:03d}.jsonl"
+
+
 def prepare_batch(sample: int | None = None):
+    from .data import BATCH_DIR
     df = load_events()
     done = already_classified()
     pending = df[~df["GLOBALEVENTID"].isin(done)]
@@ -55,86 +64,143 @@ def prepare_batch(sample: int | None = None):
     if sample:
         pending = pending.sample(min(sample, len(pending)), random_state=42)
 
-    print(f"Preparing {len(pending):,} requests (skipping {len(done):,} already classified).")
+    n_chunks = max(1, (len(pending) + CHUNK_SIZE - 1) // CHUNK_SIZE)
+    print(f"Preparing {len(pending):,} requests in {n_chunks} chunk(s) "
+          f"(skipping {len(done):,} already classified).")
 
-    with open(BATCH_JSONL, "w") as f:
-        for _, row in pending.iterrows():
-            request = {
-                "custom_id": str(row["GLOBALEVENTID"]),
-                "method": "POST",
-                "url": "/v1/chat/completions",
-                "body": {
-                    "model": MODEL,
-                    "temperature": 0,
-                    "max_tokens": 80,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": build_user_message(row["SOURCEURL"])},
-                    ],
-                },
-            }
-            f.write(json.dumps(request) + "\n")
+    chunk_files = []
+    for i, start in enumerate(range(0, len(pending), CHUNK_SIZE), start=1):
+        chunk = pending.iloc[start : start + CHUNK_SIZE]
+        path = _chunk_path(i)
+        with open(path, "w") as f:
+            for _, row in chunk.iterrows():
+                request = {
+                    "custom_id": str(row["GLOBALEVENTID"]),
+                    "method": "POST",
+                    "url": "/v1/chat/completions",
+                    "body": {
+                        "model": MODEL,
+                        "temperature": 0,
+                        "max_tokens": 80,
+                        "response_format": {"type": "json_object"},
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": build_user_message(row["SOURCEURL"])},
+                        ],
+                    },
+                }
+                f.write(json.dumps(request) + "\n")
+        size_mb = path.stat().st_size / 1_048_576
+        print(f"  Chunk {i}/{n_chunks}: {len(chunk):,} requests  ({size_mb:.0f} MB)  → {path.name}")
+        chunk_files.append(str(path))
 
-    print(f"Wrote {BATCH_JSONL}")
+    # Write a plan file listing all chunk paths for submit to pick up
+    plan = {"chunk_files": chunk_files}
+    (BATCH_DIR / "batch_plan.json").write_text(json.dumps(plan, indent=2))
+    print("Done. Run --submit to upload and submit all chunks.")
 
 
 def submit_batch():
+    """Submit the next unsubmitted chunk. Run repeatedly after each chunk completes."""
+    from .data import BATCH_DIR
+    plan_path = BATCH_DIR / "batch_plan.json"
+    if not plan_path.exists():
+        print("No batch plan found. Run --prepare first.")
+        sys.exit(1)
+
     client = OpenAI()
+    chunk_files = json.loads(plan_path.read_text())["chunk_files"]
+    n_total = len(chunk_files)
 
-    print(f"Uploading {BATCH_JSONL} ...")
-    with open(BATCH_JSONL, "rb") as f:
+    # Load already-submitted batches
+    batches = []
+    if BATCH_META.exists():
+        batches = json.loads(BATCH_META.read_text()).get("batches", [])
+
+    submitted_chunks = {b["chunk"] for b in batches}
+    next_chunks = [i for i in range(1, n_total + 1) if i not in submitted_chunks]
+
+    if not next_chunks:
+        print("All chunks already submitted. Run --status to check progress.")
+        return
+
+    i = next_chunks[0]
+    path = chunk_files[i - 1]
+    print(f"Uploading chunk {i}/{n_total}: {path} ...")
+    with open(path, "rb") as f:
         uploaded = client.files.create(file=f, purpose="batch")
-
-    print(f"File uploaded: {uploaded.id}  Creating batch job...")
     batch = client.batches.create(
         input_file_id=uploaded.id,
         endpoint="/v1/chat/completions",
         completion_window="24h",
     )
+    print(f"Submitted: {batch.id}  status: {batch.status}")
+    batches.append({"batch_id": batch.id, "file_id": uploaded.id, "chunk": i})
+    BATCH_META.write_text(json.dumps({"batches": batches}, indent=2))
 
-    meta = {"batch_id": batch.id, "file_id": uploaded.id}
-    BATCH_META.write_text(json.dumps(meta, indent=2))
-    print(f"Batch submitted: {batch.id}")
-    print(f"Status: {batch.status}  — check with: python -m url_classifier --status")
+    remaining = len(next_chunks) - 1
+    if remaining:
+        print(f"\n{remaining} chunk(s) remaining. After this one completes, run --submit again.")
+    else:
+        print("\nFinal chunk submitted.")
+    print("Check with: python -m tools.url_classifier --status")
 
 
 def check_status():
     client = OpenAI()
     meta = json.loads(BATCH_META.read_text())
-    batch = client.batches.retrieve(meta["batch_id"])
-    counts = batch.request_counts
-    print(
-        f"Batch {batch.id}: {batch.status}\n"
-        f"  total={counts.total}  completed={counts.completed}  failed={counts.failed}"
-    )
-    if batch.status == "completed":
-        print("Ready to collect — run: python -m url_classifier --collect")
-    return batch
+    batches = meta.get("batches") or [{"batch_id": meta["batch_id"], "chunk": 1}]
+
+    all_done = True
+    total = completed = failed = 0
+    for entry in batches:
+        batch = client.batches.retrieve(entry["batch_id"])
+        c = batch.request_counts
+        total     += c.total
+        completed += c.completed
+        failed    += c.failed
+        if batch.status != "completed":
+            all_done = False
+        label = f"chunk {entry['chunk']}" if len(batches) > 1 else "batch"
+        print(f"{label}  {batch.id}: {batch.status}  "
+              f"total={c.total}  completed={c.completed}  failed={c.failed}")
+
+    if len(batches) > 1:
+        print(f"\nOverall: total={total}  completed={completed}  failed={failed}")
+
+    if all_done:
+        print("All chunks complete — run: python -m tools.url_classifier --collect")
+    return all_done
 
 
 def collect_results():
     client = OpenAI()
     meta = json.loads(BATCH_META.read_text())
-    batch = client.batches.retrieve(meta["batch_id"])
-
-    if batch.status != "completed":
-        print(f"Batch not ready yet (status: {batch.status}). Try --status again later.")
-        sys.exit(1)
-
-    print(f"Downloading results (file: {batch.output_file_id}) ...")
-    content = client.files.content(batch.output_file_id).text
-    BATCH_RESULTS.write_text(content)
+    batches = meta.get("batches") or [{"batch_id": meta["batch_id"], "chunk": 1}]
 
     rows = []
-    for line in content.strip().split("\n"):
-        if line:
-            result = parse_result_line(line)
-            if result:
-                rows.append(result)
+    skipped = []
+    for entry in batches:
+        batch = client.batches.retrieve(entry["batch_id"])
+        if batch.status != "completed":
+            skipped.append(entry["chunk"])
+            print(f"Chunk {entry['chunk']} not ready (status: {batch.status}) — skipping.")
+            continue
+        print(f"Downloading chunk {entry['chunk']} (file: {batch.output_file_id}) ...")
+        content = client.files.content(batch.output_file_id).text
+        with open(BATCH_RESULTS, "a") as f:
+            f.write(content)
+        for line in content.strip().split("\n"):
+            if line:
+                result = parse_result_line(line)
+                if result:
+                    rows.append(result)
+
+    if not rows:
+        print("No completed chunks to collect yet.")
+        sys.exit(0)
 
     results_df = pd.DataFrame(rows)
-
     events_df = load_events()[["GLOBALEVENTID", "SOURCEURL"]].rename(
         columns={"SOURCEURL": "source_url"}
     )
@@ -148,7 +214,6 @@ def collect_results():
         )
 
     results_df.to_csv(OUTPUT_CSV, index=False)
-
     counts = results_df["classification"].value_counts()
     print(f"\nSaved {len(results_df):,} classifications to {OUTPUT_CSV}")
     print(counts.to_string())

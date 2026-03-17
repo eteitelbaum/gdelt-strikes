@@ -37,22 +37,33 @@ Run these commands from the **repo root** with the virtual environment active.
 
 ### Pass 1
 
+The 30k events are split into chunks of 10,000 requests (~81 MB, ~17.8M
+tokens each) to stay within OpenAI's 200 MB file size limit and 20M
+enqueued-token limit. Only one chunk can be in-flight at a time, so the
+workflow is a loop: submit → wait → collect → submit next.
+
 ```bash
-# Build batch JSONL from the input parquet
+# Build batch JSONL chunks from the input parquet (creates 4 chunk files)
 python -m tools.url_classifier --prepare
 
-# Upload to OpenAI and submit batch job
+# Submit chunk 1 (subsequent calls submit the next unsubmitted chunk)
 python -m tools.url_classifier --submit
 
 # Check status (repeat until "completed")
 python -m tools.url_classifier --status
 
-# Download results → data/enhanced/url_classifications.csv
+# Collect completed chunk → appends to url_classifications.csv
 python -m tools.url_classifier --collect
+
+# Submit chunk 2, wait, collect — repeat until all 4 chunks are done
+python -m tools.url_classifier --submit
+python -m tools.url_classifier --status
+python -m tools.url_classifier --collect
+# ... and so on for chunks 3 and 4
 ```
 
-The batch runs on OpenAI's servers — your machine does not need to stay
-awake between `--submit` and `--collect`. Expect 1–4 hours for ~30k events.
+Your machine does not need to stay awake between `--submit` and `--collect`
+— the batch runs on OpenAI's servers. Expect 1–3 hours per chunk.
 
 ### Pass 2
 
@@ -126,9 +137,10 @@ The following files are created during a run and are gitignored:
 
 | File | Description |
 |------|-------------|
-| `tools/url_classifier/batch_requests.jsonl` | Pass 1 batch input |
-| `tools/url_classifier/batch_meta.json` | Pass 1 batch ID (needed for status/collect) |
-| `tools/url_classifier/batch_results.jsonl` | Pass 1 raw results from OpenAI |
+| `tools/url_classifier/batch_plan.json` | List of chunk files created by `--prepare` |
+| `tools/url_classifier/batch_requests_001.jsonl` … `_004.jsonl` | Pass 1 batch chunks |
+| `tools/url_classifier/batch_meta.json` | Submitted batch IDs (needed for status/collect) |
+| `tools/url_classifier/batch_results.jsonl` | Pass 1 raw results from OpenAI (appended per chunk) |
 | `tools/url_classifier/pass2_batch_requests.jsonl` | Pass 2 batch input |
 | `tools/url_classifier/pass2_batch_meta.json` | Pass 2 batch ID |
 | `tools/url_classifier/pass2_batch_results.jsonl` | Pass 2 raw results |
