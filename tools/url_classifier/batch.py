@@ -179,11 +179,13 @@ def collect_results():
     batches = meta.get("batches") or [{"batch_id": meta["batch_id"], "chunk": 1}]
 
     rows = []
-    skipped = []
+    newly_collected = []
     for entry in batches:
+        if entry.get("collected"):
+            print(f"Chunk {entry['chunk']} already collected — skipping.")
+            continue
         batch = client.batches.retrieve(entry["batch_id"])
         if batch.status != "completed":
-            skipped.append(entry["chunk"])
             print(f"Chunk {entry['chunk']} not ready (status: {batch.status}) — skipping.")
             continue
         print(f"Downloading chunk {entry['chunk']} (file: {batch.output_file_id}) ...")
@@ -195,15 +197,22 @@ def collect_results():
                 result = parse_result_line(line)
                 if result:
                     rows.append(result)
+        entry["collected"] = True
+        newly_collected.append(entry["chunk"])
+
+    # Persist collected flags
+    BATCH_META.write_text(json.dumps({"batches": batches}, indent=2))
 
     if not rows:
-        print("No completed chunks to collect yet.")
+        print("No new completed chunks to collect.")
         sys.exit(0)
 
     results_df = pd.DataFrame(rows)
+    results_df["GLOBALEVENTID"] = results_df["GLOBALEVENTID"].astype("int64")
     events_df = load_events()[["GLOBALEVENTID", "SOURCEURL"]].rename(
         columns={"SOURCEURL": "source_url"}
     )
+    events_df["GLOBALEVENTID"] = events_df["GLOBALEVENTID"].astype("int64")
     results_df = results_df.merge(events_df, on="GLOBALEVENTID", how="left")
     results_df = results_df[["GLOBALEVENTID", "source_url", "classification", "reasoning"]]
 
