@@ -1,0 +1,321 @@
+---
+title: "Contagion Panel: Diagnostics"
+format:
+  html:
+    code-fold: true
+    toc: true
+    fig-width: 10
+    fig-height: 6
+---
+
+Exploratory diagnostics for `data/analysis/contagion_panel.parquet`. This
+notebook loads the final analysis panel and visualizes its key properties —
+coverage, strike distributions, neighbor exposure, and institutional moderators.
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(sf)
+library(scales)
+library(here)
+
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(dplyr::lag)
+conflicted::conflicts_prefer(lubridate::date)
+
+theme_set(theme_minimal(base_size = 12))
+
+panel <- read_parquet(here("data/analysis/contagion_panel.parquet"))
+adm1_sf <- st_read(
+  here("data/spatial/gadm_adm1_simplified.gpkg"),
+  quiet = TRUE
+)
+
+cat("Panel rows:    ", nrow(panel), "\n")
+cat("ADM1 units:    ", n_distinct(panel$gid_1), "\n")
+cat("Countries:     ", n_distinct(panel$gid_0), "\n")
+cat("Weeks:         ", n_distinct(panel$week_start), "\n")
+cat("Date range:    ", format(min(panel$week_start)), "–",
+                       format(max(panel$week_start)), "\n")
+cat("Strike onset %:", round(mean(panel$strike_onset) * 100, 2), "\n")
+```
+
+---
+
+## 1. Strike events over time
+
+Global weekly strike onset count across all ADM1 units.
+
+```{r}
+#| label: strikes-over-time
+
+panel |>
+  group_by(week_start) |>
+  summarize(n_striking = sum(strike_onset), .groups = "drop") |>
+  ggplot(aes(week_start, n_striking)) +
+  geom_line(linewidth = 0.4, color = "steelblue") +
+  geom_smooth(method = "loess", span = 0.15, se = FALSE,
+              color = "firebrick", linewidth = 0.8) +
+  labs(
+    title = "Weekly ADM1 strike onsets (global)",
+    x = NULL, y = "ADM1 units with ≥1 strike"
+  )
+```
+
+---
+
+## 2. Strike frequency by country
+
+Top 30 countries by total ADM1-weeks with strike onset.
+
+```{r}
+#| label: strikes-by-country
+
+panel |>
+  group_by(gid_0) |>
+  summarize(total_onset_weeks = sum(strike_onset), .groups = "drop") |>
+  slice_max(total_onset_weeks, n = 30) |>
+  mutate(gid_0 = fct_reorder(gid_0, total_onset_weeks)) |>
+  ggplot(aes(total_onset_weeks, gid_0)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Top 30 countries by ADM1-weeks with strike onset",
+    x = "ADM1-weeks with strike", y = NULL
+  )
+```
+
+---
+
+## 3. Strike frequency by ADM1 unit
+
+Distribution of strike onset rates across ADM1 units (excluding zero-strike
+units).
+
+```{r}
+#| label: adm1-strike-rate
+
+adm1_rates <- panel |>
+  group_by(gid_1, gid_0) |>
+  summarize(
+    n_weeks       = n(),
+    n_onset       = sum(strike_onset),
+    onset_rate    = mean(strike_onset),
+    .groups = "drop"
+  ) |>
+  filter(n_onset > 0)
+
+cat("ADM1 units with ≥1 strike onset:", nrow(adm1_rates), "/",
+    n_distinct(panel$gid_1), "\n")
+
+ggplot(adm1_rates, aes(onset_rate)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  scale_x_continuous(labels = percent) +
+  labs(
+    title = "Distribution of strike onset rates across ADM1 units",
+    subtitle = "Units with ≥1 strike onset only",
+    x = "Strike onset rate (fraction of weeks)", y = "ADM1 units"
+  )
+```
+
+---
+
+## 4. Neighbor strike exposure
+
+Distribution of the preregistered treatment variable
+(`neighbor_strike_within_t1_t2`).
+
+```{r}
+#| label: exposure-dist
+
+panel |>
+  filter(!is.na(neighbor_strike_within_t1_t2)) |>
+  count(neighbor_strike_within_t1_t2) |>
+  mutate(
+    pct   = n / sum(n),
+    label = c("No neighbor strike", "Neighbor strike")
+  ) |>
+  ggplot(aes(label, pct)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Neighbor strike exposure (within-country, t-1 to t-2)",
+    x = NULL, y = "Share of ADM1-weeks"
+  )
+```
+
+```{r}
+#| label: exposure-by-outcome
+
+# Key descriptive: strike rate conditional on neighbor exposure
+panel |>
+  filter(!is.na(neighbor_strike_within_t1_t2)) |>
+  group_by(neighbor_strike_within_t1_t2) |>
+  summarize(
+    n            = n(),
+    strike_rate  = mean(strike_onset),
+    .groups      = "drop"
+  ) |>
+  mutate(
+    label       = c("No neighbor strike", "Neighbor strike"),
+    pct         = percent(strike_rate, accuracy = 0.1)
+  ) |>
+  ggplot(aes(label, strike_rate)) +
+  geom_col(fill = c("steelblue", "firebrick")) +
+  geom_text(aes(label = pct), vjust = -0.4, size = 4) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Strike onset rate by neighbor exposure",
+    subtitle = "Raw (unconditional) association",
+    x = NULL, y = "Strike onset rate"
+  )
+```
+
+---
+
+## 5. Geo quality flag
+
+Breakdown of validated vs. unvalidated events contributing to strike onsets.
+
+```{r}
+#| label: geo-quality
+
+panel |>
+  filter(strike_onset == 1) |>
+  count(geo_quality) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) |>
+  knitr::kable(caption = "Strike onset weeks by geo_quality")
+```
+
+---
+
+## 6. V-Dem institutional moderators
+
+```{r}
+#| label: vdem-dist
+
+panel |>
+  distinct(gid_0, week_start, freexp, frassoc, repression) |>
+  select(freexp, frassoc, repression) |>
+  pivot_longer(everything(), names_to = "variable",
+               names_ptypes = list(variable = factor())) |>
+  mutate(variable = recode(variable,
+    freexp     = "Freedom of expression",
+    frassoc    = "Freedom of association",
+    repression = "State repression"
+  )) |>
+  ggplot(aes(value)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(
+    title = "V-Dem institutional moderator distributions",
+    subtitle = "Country-year level (repeated across weeks within year)",
+    x = "V-Dem index value", y = "Country-years"
+  )
+```
+
+```{r}
+#| label: vdem-summary
+
+panel |>
+  distinct(gid_0, week_start, freexp, frassoc, repression) |>
+  select(freexp, frassoc, repression) |>
+  pivot_longer(everything(), names_to = "variable") |>
+  group_by(variable) |>
+  summarize(
+    n       = sum(!is.na(value)),
+    mean    = round(mean(value, na.rm = TRUE), 3),
+    sd      = round(sd(value, na.rm = TRUE), 3),
+    p10     = round(quantile(value, .10, na.rm = TRUE), 3),
+    p50     = round(quantile(value, .50, na.rm = TRUE), 3),
+    p90     = round(quantile(value, .90, na.rm = TRUE), 3),
+    missing = sum(is.na(value)),
+    .groups = "drop"
+  ) |>
+  knitr::kable(caption = "V-Dem moderator summary statistics")
+```
+
+---
+
+## 7. Coverage map
+
+Which ADM1 units are in the panel, and how many strike onsets did each have?
+
+```{r}
+#| label: coverage-map
+#| fig-height: 7
+
+strike_counts <- panel |>
+  group_by(gid_1) |>
+  summarize(n_onset = sum(strike_onset), .groups = "drop")
+
+map_data <- adm1_sf |>
+  left_join(strike_counts, by = c("GID_1" = "gid_1")) |>
+  mutate(
+    status = case_when(
+      is.na(n_onset) ~ "Not in panel",
+      n_onset == 0   ~ "In panel, no strikes",
+      TRUE           ~ "In panel, ≥1 strike"
+    ),
+    n_onset_log = log1p(n_onset)
+  )
+
+ggplot(map_data) +
+  geom_sf(aes(fill = n_onset_log), linewidth = 0.05, color = "white") +
+  geom_sf(
+    data = map_data |> filter(is.na(n_onset)),
+    fill = "#d9d9d9", linewidth = 0.05, color = "white"
+  ) +
+  scale_fill_gradient(
+    low = "#c6dbef", high = "#08306b",
+    na.value = "#d9d9d9",
+    name = "Weeks",
+    labels = \(x) round(expm1(x)),
+    breaks = log1p(c(2, 6, 19, 54, 147))
+  ) +
+  labs(
+    title    = "Strike Prevalence Across Subnational Regions, 2015–2025",
+    subtitle = "Number of weeks with recorded strike activity.",
+    caption  = "Strike data derived from GDELT; boundaries from GADM."
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position  = "right",
+    axis.text        = element_blank(),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.2)
+  )
+```
+
+```{r}
+#| label: isolates-map
+#| fig-height: 7
+
+# Highlight isolates (no within-country neighbors)
+adj <- readRDS(here("data/spatial/gadm_adjacency.rds"))
+isolates <- adj$summary |> filter(n_neighbors_within == 0)
+
+map_isolates <- adm1_sf |>
+  filter(GID_1 %in% unique(panel$gid_1)) |>
+  mutate(is_isolate = GID_1 %in% isolates$gid_1)
+
+ggplot(map_isolates) +
+  geom_sf(aes(fill = is_isolate), linewidth = 0.05, color = "white") +
+  scale_fill_manual(
+    values = c("FALSE" = "#c6dbef", "TRUE" = "firebrick"),
+    labels = c("FALSE" = "Has neighbors", "TRUE" = "Isolate (no within-country neighbor)"),
+    name = NULL
+  ) +
+  labs(
+    title = "ADM1 isolates: units with no within-country neighbors",
+    subtitle = "Isolates receive NA exposure and are excluded from main specification"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position  = "bottom",
+    axis.text        = element_blank(),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.2)
+  )
+```

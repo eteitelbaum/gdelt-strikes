@@ -1,0 +1,641 @@
+---
+title: "Contagion Analysis: Regression Models"
+format: html
+---
+
+Estimates the baseline LPM and institutional moderation models from the
+preregistered analysis plan.
+
+**Specification**:
+$$Y_{it} = \beta \cdot \text{NeighborStrike}_{i,t-1:t-2} + \alpha_i + \gamma_{c \times t} + \varepsilon_{it}$$
+
+where $\alpha_i$ are ADM1 fixed effects and $\gamma_{c \times t}$ are
+country×week fixed effects. Standard errors clustered at the ADM1 level.
+
+Requires: `data/analysis/contagion_panel.parquet` (from `contagion-data-build.qmd`)
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(fixest)
+library(modelsummary)
+library(marginaleffects)
+library(patchwork)
+library(here)
+
+conflicted::conflicts_prefer(dplyr::filter)
+conflicted::conflicts_prefer(dplyr::lag)
+```
+
+---
+
+## Load data
+
+```{r}
+#| label: load-data
+
+panel <- read_parquet(here("data/analysis/contagion_panel.parquet"))
+
+cat("Rows:", nrow(panel), "\n")
+cat("ADM1 units:", n_distinct(panel$gid_1), "\n")
+cat("Countries:", n_distinct(panel$gid_0), "\n")
+cat("Weeks:", n_distinct(panel$week_start), "\n")
+```
+
+```{r}
+#| label: analysis-sample
+
+# Restrict to observations with non-missing treatment and outcome
+# (i.e., regions with at least one within-country neighbor)
+analysis <- panel |>
+  filter(!is.na(neighbor_strike_within_t1_t2), !is.na(strike_onset))
+
+cat("Analysis sample:", nrow(analysis), "ADM1-weeks\n")
+cat("Units dropped (no within-country neighbor or missing outcome):",
+    nrow(panel) - nrow(analysis), "\n")
+```
+
+---
+
+## Baseline model (H1: demonstration effect)
+
+```{r}
+#| label: m-baseline
+
+m_baseline <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 | gid_1 + country_week,
+  data    = analysis,
+  cluster = ~gid_1
+)
+
+summary(m_baseline)
+```
+
+---
+
+## Moderation models (H2–H4)
+
+Each model adds one V-Dem institutional moderator and its interaction with the
+treatment. The moderators are standardized (z-scored) so the main effect of
+`neighbor_strike_within_t1_t2` can be interpreted at the mean of the moderator.
+
+```{r}
+#| label: m-freexp
+
+# H2: Freedom of expression amplifies diffusion
+m_freexp <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * freexp_z | gid_1 + country_week,
+  data    = analysis,
+  cluster = ~gid_1
+)
+
+summary(m_freexp)
+```
+
+```{r}
+#| label: m-frassoc
+
+# H3: Freedom of association amplifies diffusion
+m_frassoc <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * frassoc_z | gid_1 + country_week,
+  data    = analysis,
+  cluster = ~gid_1
+)
+
+summary(m_frassoc)
+```
+
+```{r}
+#| label: m-repression
+
+# H4: State repression dampens diffusion
+m_repression <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * repression_z | gid_1 + country_week,
+  data    = analysis,
+  cluster = ~gid_1
+)
+
+summary(m_repression)
+```
+
+---
+
+## Regression tables
+
+```{r}
+#| label: table-main
+#| tbl-cap: "Linear probability models: neighbor strike exposure and institutional moderation"
+
+models <- list(
+  "(1) Baseline"   = m_baseline,
+  "(2) Expression" = m_freexp,
+  "(3) Association" = m_frassoc,
+  "(4) Repression"  = m_repression
+)
+
+coef_labels <- c(
+  "neighbor_strike_within_t1_t2"                  = "Neighbor strike (t-1, t-2)",
+  "freexp_z"                                        = "Freedom of expression (z)",
+  "frassoc_z"                                       = "Freedom of assoc. (z)",
+  "repression_z"                                    = "State repression (z)",
+  "neighbor_strike_within_t1_t2:freexp_z"          = "Neighbor strike × Expression",
+  "neighbor_strike_within_t1_t2:frassoc_z"         = "Neighbor strike × Association",
+  "neighbor_strike_within_t1_t2:repression_z"      = "Neighbor strike × Repression"
+)
+
+rows <- tribble(
+  ~term,               ~"(1) Baseline", ~"(2) Expression", ~"(3) Association", ~"(4) Repression",
+  "ADM1 FE",           "Yes",           "Yes",              "Yes",              "Yes",
+  "Country × week FE", "Yes",           "Yes",              "Yes",              "Yes"
+)
+attr(rows, "position") <- c(10, 11)
+
+modelsummary(
+  models,
+  coef_map   = coef_labels,
+  add_rows   = rows,
+  stars      = c("*" = .1, "**" = .05, "***" = .01),
+  gof_map    = c("nobs", "r.squared"),
+  output     = "gt"
+)
+```
+
+---
+
+## Marginal effects plots
+
+### H1: Average marginal effect of neighbor strike
+
+```{r}
+#| label: plot-ame-baseline
+#| fig-width: 5
+#| fig-height: 3
+
+avg_slopes(m_baseline, variables = "neighbor_strike_within_t1_t2") |>
+  tidy() |>
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = 1)) +
+  geom_pointrange() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title   = "Average marginal effect of neighbor strike",
+    x       = "Change in P(strike onset)",
+    y       = NULL,
+    caption = "LPM with ADM1 and country×week FEs. SEs clustered at ADM1."
+  ) +
+  theme_minimal() +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+### H2–H4: Conditional effects across the distribution of each moderator
+
+```{r}
+#| label: plot-conditional-effects
+#| fig-width: 10
+#| fig-height: 4
+
+plot_conditional <- function(model, moderator, label) {
+  plot_slopes(
+    model,
+    variables  = "neighbor_strike_within_t1_t2",
+    condition  = moderator,
+    draw       = FALSE
+  ) |>
+    ggplot(aes(x = .data[[moderator]], y = estimate,
+               ymin = conf.low, ymax = conf.high)) +
+    geom_ribbon(alpha = 0.15) +
+    geom_line() +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+    labs(
+      title = glue::glue("Conditional effect: {label}"),
+      x     = label,
+      y     = "Effect of neighbor strike on P(onset)"
+    ) +
+    theme_minimal()
+}
+
+p_freexp    <- plot_conditional(m_freexp,    "freexp_z",    "Freedom of expression (z)")
+p_frassoc   <- plot_conditional(m_frassoc,   "frassoc_z",   "Freedom of association (z)")
+p_repression <- plot_conditional(m_repression, "repression_z", "State repression (z)")
+
+library(patchwork)
+p_freexp | p_frassoc | p_repression
+```
+
+---
+
+## Joint moderation model (H2–H4 together, ADM1 + week FEs)
+
+The separate moderation models above use `country×week` FEs, which absorb the
+V-Dem moderators (annual, country-level) via collinearity. To identify the
+moderator main effects and interactions, we switch to `ADM1 + week` FEs and
+include all three moderators simultaneously. This trades some causal
+identification of the treatment for the ability to estimate the institutional
+interactions.
+
+```{r}
+#| label: m-joint-moderation
+
+m_joint_mod <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * freexp_z +
+                 neighbor_strike_within_t1_t2 * frassoc_z +
+                 neighbor_strike_within_t1_t2 * repression_z | gid_1 + week_start,
+  data    = analysis,
+  cluster = ~gid_1
+)
+
+summary(m_joint_mod)
+```
+
+```{r}
+#| label: table-joint-moderation
+#| tbl-cap: "Joint moderation model: all three institutional moderators (ADM1 + week FEs)"
+
+joint_coef <- c(
+  "neighbor_strike_within_t1_t2"              = "Neighbor strike (t-1, t-2)",
+  "freexp_z"                                   = "Freedom of expression (z)",
+  "frassoc_z"                                  = "Freedom of assoc. (z)",
+  "repression_z"                               = "State repression (z)",
+  "neighbor_strike_within_t1_t2:freexp_z"     = "Neighbor strike × Expression",
+  "neighbor_strike_within_t1_t2:frassoc_z"    = "Neighbor strike × Association",
+  "neighbor_strike_within_t1_t2:repression_z" = "Neighbor strike × Repression"
+)
+
+joint_rows <- tribble(
+  ~term,               ~"Joint model",
+  "ADM1 FE",           "Yes",
+  "Week FE",           "Yes"
+)
+attr(joint_rows, "position") <- c(10, 11)
+
+modelsummary(
+  list("Joint model" = m_joint_mod),
+  coef_map   = joint_coef,
+  add_rows   = joint_rows,
+  stars      = c("*" = .1, "**" = .05, "***" = .01),
+  gof_map    = c("nobs", "r.squared"),
+  output     = "gt"
+)
+```
+
+---
+
+## Robustness checks
+
+### Separate t-1 and t-2 lags
+
+```{r}
+#| label: robustness-separate-lags
+
+m_lag1 <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t1 | gid_1 + country_week,
+  data    = analysis,
+  cluster = ~gid_1
+)
+
+m_lag2 <- feols(
+  strike_onset ~ neighbor_strike_within_t2_t2 | gid_1 + country_week,
+  data    = analysis,
+  cluster = ~gid_1
+)
+
+modelsummary(
+  list("t-1 only" = m_lag1, "t-2 only" = m_lag2, "Pooled t-1:t-2" = m_baseline),
+  coef_map = c(
+    "neighbor_strike_within_t1_t1" = "Neighbor strike (t-1)",
+    "neighbor_strike_within_t2_t2" = "Neighbor strike (t-2)",
+    "neighbor_strike_within_t1_t2" = "Neighbor strike (pooled)"
+  ),
+  stars  = c("*" = .1, "**" = .05, "***" = .01),
+  gof_map = c("nobs", "r.squared"),
+  output = "gt"
+)
+```
+
+### Logistic regression
+
+```{r}
+#| label: robustness-logit
+
+m_logit <- feglm(
+  strike_onset ~ neighbor_strike_within_t1_t2 | gid_1 + country_week,
+  family  = binomial,
+  data    = analysis,
+  cluster = ~gid_1
+)
+
+summary(m_logit)
+```
+
+### Two-way clustering (ADM1 + country-week)
+
+```{r}
+#| label: robustness-twoway-cluster
+
+m_twoway <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 | gid_1 + country_week,
+  data    = analysis,
+  cluster = ~gid_1 + country_week
+)
+
+modelsummary(
+  list("ADM1 cluster" = m_baseline, "Two-way cluster" = m_twoway),
+  coef_map = c("neighbor_strike_within_t1_t2" = "Neighbor strike (t-1, t-2)"),
+  stars    = c("*" = .1, "**" = .05, "***" = .01),
+  gof_map  = c("nobs", "r.squared"),
+  output   = "gt"
+)
+```
+
+---
+
+## National vs. neighborhood contagion decomposition
+
+The baseline LPM with `country×week` FEs yields a null treatment effect, while
+`ADM1 + week` FEs yield a positive effect (~1.5 pp). To understand why, we
+decompose the apparent neighborhood effect into:
+
+- **Country-level contagion**: did any other region in the same country strike
+  in $t-1$ or $t-2$? (`country_strike_t1_t2`)
+- **Neighborhood-specific diffusion**: does a geographic neighbor's strike
+  predict onset *above and beyond* the country-level signal?
+
+```{r}
+#| label: build-country-strike
+
+# Country-week total strike count, then lagged
+country_weekly <- panel |>
+  group_by(gid_0, week_start) |>
+  summarize(country_strike_count = sum(strike_onset), .groups = "drop")
+
+panel_decomp <- panel |>
+  left_join(country_weekly, by = c("gid_0", "week_start")) |>
+  arrange(gid_0, week_start) |>
+  group_by(gid_0) |>
+  mutate(
+    country_strike_t1    = dplyr::lag(country_strike_count, 1),
+    country_strike_t2    = dplyr::lag(country_strike_count, 2),
+    country_strike_t1_t2 = as.integer((country_strike_t1 + country_strike_t2) > 0)
+  ) |>
+  ungroup()
+
+analysis_decomp <- panel_decomp |>
+  filter(
+    !is.na(neighbor_strike_within_t1_t2),
+    !is.na(strike_onset),
+    !is.na(country_strike_t1_t2)
+  )
+
+cat("Decomposition sample:", nrow(analysis_decomp), "ADM1-weeks\n")
+cat("Country strike prevalence:",
+    round(mean(analysis_decomp$country_strike_t1_t2) * 100, 1), "%\n")
+```
+
+```{r}
+#| label: m-country-only
+
+# M1: country-level contagion only
+m_country <- feols(
+  strike_onset ~ country_strike_t1_t2 | gid_1 + week_start,
+  data    = analysis_decomp,
+  cluster = ~gid_1
+)
+
+summary(m_country)
+```
+
+```{r}
+#| label: m-neighbor-only-adm1week
+
+# M2: neighborhood contagion only (ADM1 + week FEs for comparability)
+m_neighbor_aw <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 | gid_1 + week_start,
+  data    = analysis_decomp,
+  cluster = ~gid_1
+)
+
+summary(m_neighbor_aw)
+```
+
+```{r}
+#| label: m-decomp
+
+# M3: both together — does geographic neighbor add anything beyond country wave?
+m_decomp <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 + country_strike_t1_t2 |
+    gid_1 + week_start,
+  data    = analysis_decomp,
+  cluster = ~gid_1
+)
+
+summary(m_decomp)
+```
+
+```{r}
+#| label: m-decomp-frassoc
+
+# M4: add frassoc moderation on the neighborhood term
+m_decomp_frassoc <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * frassoc_z +
+                 country_strike_t1_t2 | gid_1 + week_start,
+  data    = analysis_decomp,
+  cluster = ~gid_1
+)
+
+summary(m_decomp_frassoc)
+```
+
+```{r}
+#| label: table-decomp
+#| tbl-cap: "National vs. neighborhood contagion decomposition"
+
+decomp_models <- list(
+  "(1) Country"        = m_country,
+  "(2) Neighbor"       = m_neighbor_aw,
+  "(3) Decomposition"  = m_decomp,
+  "(4) + frassoc"      = m_decomp_frassoc
+)
+
+decomp_coef <- c(
+  "neighbor_strike_within_t1_t2"         = "Neighbor strike (t-1, t-2)",
+  "country_strike_t1_t2"                 = "Country strike (t-1, t-2)",
+  "frassoc_z"                            = "Freedom of assoc. (z)",
+  "neighbor_strike_within_t1_t2:frassoc_z" = "Neighbor strike × Assoc."
+)
+
+decomp_rows <- tribble(
+  ~term,               ~"(1) Country", ~"(2) Neighbor", ~"(3) Decomposition", ~"(4) + frassoc",
+  "ADM1 FE",           "Yes",          "Yes",            "Yes",                "Yes",
+  "Week FE",           "Yes",          "Yes",            "Yes",                "Yes"
+)
+attr(decomp_rows, "position") <- c(8, 9)
+
+modelsummary(
+  decomp_models,
+  coef_map   = decomp_coef,
+  add_rows   = decomp_rows,
+  stars      = c("*" = .1, "**" = .05, "***" = .01),
+  gof_map    = c("nobs", "r.squared"),
+  output     = "gt"
+)
+```
+
+---
+
+## Exploratory: cross-border diffusion
+
+Sample restricted to ADM1 units with at least one cross-border neighbor (~95
+units). `country×week` FEs are appropriate here: the treatment is a *foreign*
+neighbor's behavior, so it is not absorbed by the focal region's country-week
+FE. Both `country×week` and `ADM1 + week` specs are shown for comparability.
+
+```{r}
+#| label: exploratory-cross-border
+
+cross_data <- analysis |> filter(!is.na(neighbor_strike_cross_t1_t2))
+cat("Cross-border sample: ADM1 units =", n_distinct(cross_data$gid_1),
+    "| rows =", nrow(cross_data), "\n")
+
+# Country×week FE (treatment is foreign, FE controls own-country shocks)
+m_cross_cw <- feols(
+  strike_onset ~ neighbor_strike_cross_t1_t2 | gid_1 + country_week,
+  data    = cross_data,
+  cluster = ~gid_1
+)
+
+# ADM1 + week FE (for comparability with main specs)
+m_cross_aw <- feols(
+  strike_onset ~ neighbor_strike_cross_t1_t2 | gid_1 + week_start,
+  data    = cross_data,
+  cluster = ~gid_1
+)
+
+summary(m_cross_cw)
+summary(m_cross_aw)
+```
+
+```{r}
+#| label: exploratory-joint
+
+joint_data <- analysis |>
+  filter(!is.na(neighbor_strike_within_t1_t2),
+         !is.na(neighbor_strike_cross_t1_t2))
+
+# Within + cross-border, country×week FE
+m_joint_cw <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 + neighbor_strike_cross_t1_t2 |
+    gid_1 + country_week,
+  data    = joint_data,
+  cluster = ~gid_1
+)
+
+# Within + cross-border, ADM1 + week FE
+m_joint_aw <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 + neighbor_strike_cross_t1_t2 |
+    gid_1 + week_start,
+  data    = joint_data,
+  cluster = ~gid_1
+)
+
+modelsummary(
+  list(
+    "Cross only (cw FE)"    = m_cross_cw,
+    "Cross only (week FE)"  = m_cross_aw,
+    "Joint (cw FE)"         = m_joint_cw,
+    "Joint (week FE)"       = m_joint_aw
+  ),
+  coef_map = c(
+    "neighbor_strike_within_t1_t2" = "Neighbor strike within (t-1, t-2)",
+    "neighbor_strike_cross_t1_t2"  = "Neighbor strike cross-border (t-1, t-2)"
+  ),
+  stars   = c("*" = .1, "**" = .05, "***" = .01),
+  gof_map = c("nobs", "r.squared"),
+  output  = "gt"
+)
+```
+
+---
+
+## Validated locations only
+
+Robustness check restricting to events where the ADM1 geocode was confirmed
+correct by the LLM validation step (`geo_quality == "validated"`). Unvalidated
+strike weeks are recoded as zero-strike weeks, keeping the balanced panel intact.
+
+```{r}
+#| label: validated-sample
+
+panel_val <- panel |>
+  mutate(
+    strike_onset_val = as.integer(geo_quality == "validated")
+  )
+
+panel_val_decomp <- panel_decomp |>
+  mutate(
+    strike_onset_val = as.integer(geo_quality == "validated")
+  )
+
+analysis_val <- panel_val |>
+  filter(!is.na(neighbor_strike_within_t1_t2))
+
+analysis_val_decomp <- panel_val_decomp |>
+  filter(!is.na(neighbor_strike_within_t1_t2),
+         !is.na(country_strike_t1_t2))
+
+cat("Validated outcome prevalence:",
+    round(mean(analysis_val$strike_onset_val) * 100, 2), "%\n")
+cat("(vs.", round(mean(analysis$strike_onset) * 100, 2),
+    "% in full sample)\n")
+```
+
+```{r}
+#| label: validated-baseline
+
+m_val_baseline <- feols(
+  strike_onset_val ~ neighbor_strike_within_t1_t2 | gid_1 + country_week,
+  data    = analysis_val,
+  cluster = ~gid_1
+)
+
+m_val_aw <- feols(
+  strike_onset_val ~ neighbor_strike_within_t1_t2 | gid_1 + week_start,
+  data    = analysis_val,
+  cluster = ~gid_1
+)
+
+summary(m_val_baseline)
+summary(m_val_aw)
+```
+
+```{r}
+#| label: validated-decomp
+
+m_val_decomp <- feols(
+  strike_onset_val ~ neighbor_strike_within_t1_t2 + country_strike_t1_t2 |
+    gid_1 + week_start,
+  data    = analysis_val_decomp,
+  cluster = ~gid_1
+)
+
+modelsummary(
+  list(
+    "Full sample\n(country×week)" = m_baseline,
+    "Full sample\n(week FE)"      = m_val_aw,
+    "Validated only\n(country×week)" = m_val_baseline,
+    "Validated only\n(week FE)"   = m_val_aw,
+    "Validated: decomp"           = m_val_decomp
+  ),
+  coef_map = c(
+    "neighbor_strike_within_t1_t2" = "Neighbor strike (t-1, t-2)",
+    "country_strike_t1_t2"         = "Country strike (t-1, t-2)"
+  ),
+  stars   = c("*" = .1, "**" = .05, "***" = .01),
+  gof_map = c("nobs", "r.squared"),
+  output  = "gt"
+)
+```

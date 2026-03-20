@@ -30,8 +30,21 @@ tools/url_classifier/pass2_batch_results.jsonl
 tools/url_classifier/pass2_batch_meta.json
 tools/url_classifier/uncertain_titles.csv
 
+# Geo validator intermediary files
+tools/geo_validator/article_texts_cache.csv
+tools/geo_validator/batch_requests*.jsonl
+tools/geo_validator/batch_plan.json
+tools/geo_validator/batch_results.jsonl
+tools/geo_validator/batch_meta.json
+
+# ADM1 crosswalk intermediary files
+tools/adm1_crosswalk/corrections_batch_requests.jsonl
+tools/adm1_crosswalk/corrections_batch_results.jsonl
+tools/adm1_crosswalk/corrections_batch_meta.json
+
 # System files
 .DS_Store
 
-# Notes
-notes/
+# Claude session files
+.claude/
+logs/
