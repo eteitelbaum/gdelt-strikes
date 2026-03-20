@@ -63,7 +63,7 @@ Subnational administrative unit (ADM1) × week.
 
 ## 4. Data Sources
 
-* **Strike events**: GDELT (event codes corresponding to labor strikes)
+* **Strike events**: GDELT (event codes corresponding to labor strikes), January 2015 – September 2025 (N ≈ 30,900 events pre-filtering)
 * **Institutional variables**: V-Dem national-level indicators
 * **Geography**: GADM ADM1 boundaries (available in `/gadm-boundaries`)
 
@@ -289,6 +289,12 @@ However, these use k-nearest neighbors rather than true border adjacency. For th
    - Distance-weighted exposure measures
    - Strike typology (industrial vs. political, if feasible)
    - Alternative lag structures
+   - Conflict control robustness check: add lagged ADM1-level conflict
+     events (UCDP GED aggregated to ADM1-year) to address the objection
+     that diffusion reflects correlated conflict dynamics rather than
+     strike contagion. Expected to be minor given the dataset is dominated
+     by economic disputes (wages, conditions, layoffs) rather than
+     politically-motivated strikes, but worth documenting.
 
 ---
 
@@ -296,7 +302,7 @@ However, these use k-nearest neighbors rather than true border adjacency. For th
 
 - [ ] Confirm specific V-Dem variable codes for institutional moderators
 - [ ] Decide on exact lag structure (1 week only, 2 weeks only, or pooled 1-2 weeks?)
-- [ ] Determine sample period (all available data vs. restricted time window)
+- [x] Determine sample period: January 2015 – September 2025
 - [ ] Specify minimum ADM1-week history requirement for inclusion in analysis
 - [ ] Determine how to handle island ADM1s or units with no contiguous neighbors
 - [ ] Clarify approach for identifying political vs. industrial strikes (CAMEO codes, actor types, or manual coding)
