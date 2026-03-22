@@ -63,45 +63,63 @@ most relevant one.
 
 ## Key Literature to Consult
 
-The following are suggested starting points. **Verify all citations before
-use** — some details below are recalled from memory and should be confirmed.
+Citations verified and updated based on search confirmation.
 
 ### Foundational / Methodological
 
-- **Leetaru & Schrodt (2013).** "GDELT: Global Data on Events, Location, and
-  Tone, 1979–2012." Presented at the ISA Annual Convention. The original
-  methodological description; addresses geolocation approach at a high level.
+- **Leetaru, Kalev and Philip A. Schrodt. 2013.** "GDELT: Global Data on
+  Events, Location, and Tone, 1979–2012." Presented at the ISA Annual
+  Convention. The original methodological description; addresses geolocation
+  approach at a high level. **In bib file.**
 
 - **Schrodt, P.A.** Various papers on TABARI and PETRARCH event coding.
   Background on the automated coding infrastructure underlying GDELT.
 
 ### Validation / Critique
 
-- **Hammond & Weidmann (2014).** "Using Machine-Coded Event Data for the
-  Micro-level Study of Political Violence." *Journal of Peace Research.*
-  Evaluates spatial accuracy of machine-coded event data; discusses the
-  dateline bias problem directly. *(Verify journal and year.)*
+- **Hammond, Jesse and Nils B. Weidmann. 2014.** "Using Machine-Coded Event
+  Data for the Micro-Level Study of Political Violence." *Research & Politics*
+  1(2). DOI: 10.1177/2053168014539924.
+  The key subnational geolocation validation paper. Benchmarks GDELT against
+  ACLED and UCDP GED for African violence at cell-month level. Documents the
+  capital city bias directly and concludes GDELT "should be used with caution
+  for geo-spatial analyses at the subnational level." **In bib file.**
+  Note: earlier drafts of this note incorrectly listed the journal as
+  *Journal of Peace Research* — it is *Research & Politics*.
 
-- **Weidmann (2016) / Weidmann & Ward.** Work comparing GDELT geolocation
-  against manually coded datasets at the sub-national level. Search for
-  Weidmann's publications on event data validation. *(Specific citation
-  needs verification.)*
+- **Raleigh, Clionadh, Andrew Linke, Håvard Hegre, and Joakim Karlsen. 2010.**
+  "Introducing ACLED: An Armed Conflict Location and Event Dataset."
+  *Journal of Peace Research* 47(5): 651–660. DOI: 10.1177/0022343310378914.
+  Introduces ACLED — cite when describing what ACLED is as a benchmark
+  dataset. There is no separate "Raleigh et al." GDELT comparison paper;
+  the GDELT/ACLED comparison is Hammond & Weidmann (2014), which uses
+  ACLED as the gold standard.
 
-- **Raleigh et al. / ACLED comparisons.** Several papers have compared GDELT
-  event locations against ACLED (Armed Conflict Location & Event Data), which
-  uses human coders. These comparisons consistently find country-level
-  agreement to be high and sub-national agreement to be substantially lower.
-  Search: "GDELT ACLED comparison geolocation."
+- **Salehyan, Idean, Cullen S. Hendrix, et al. 2012.** "Social Conflict in
+  Africa: A New Database." *International Interactions* 38(4): 503–511.
+  DOI: 10.1080/03050629.2012.697426.
+  Introduces SCAD (Social Conflict in Africa Database) — covers protests,
+  riots, strikes, and communal violence across 47 African countries,
+  1990–2010, with georeferenced locations. Peripheral for our paper but
+  useful for benchmarking subnational accuracy in African cases.
 
-- **Salehyan et al. (2012).** "Social Conflict in Africa: A New Database."
-  *International Interactions.* Introduces SCAD; comparisons with GDELT are
-  implicit in subsequent validation work on African conflict event data.
-  *(Peripheral but useful for benchmarking sub-national accuracy.)*
+- **Ward, Michael D., Andreas Beger, et al. 2013.** "Comparing GDELT and
+  ICEWS Event Data." Working paper, Duke University.
+  The canonical GDELT/ICEWS comparison — already in literature folder.
+  Note: an earlier draft of this note listed "Boschee et al." as a separate
+  ICEWS/GDELT comparison; that is the same paper. Boschee is an ICEWS
+  researcher at BBN but is not an author on the comparison paper.
 
-- **Boschee et al.** ICEWS (Integrated Crisis Early Warning System) vs. GDELT
-  comparisons. ICEWS uses a different automated coding pipeline (ACCENT/Jabari)
-  and comparisons illuminate systematic differences in geolocation. Search:
-  "ICEWS GDELT comparison."
+### Optional / Lower Priority
+
+- **Lee, Sophie J., Howard Liu, and Michael D. Ward. 2019.** "Lost in Space:
+  Geolocation in Event Data." *Political Science Research and Methods* 7(4):
+  871–888. DOI: 10.1017/psrm.2018.9.
+  Proposes a two-stage ML algorithm improving geocoding accuracy by up to 25%
+  using N-gram patterns and sentence context from full article text. Relevant
+  only if writing a footnote noting that better geocoding algorithms exist
+  but require full-text access infeasible at our global scale. Not worth
+  citing otherwise — we are not re-geocoding.
 
 ### Specifically on Capital City / Dateline Bias
 

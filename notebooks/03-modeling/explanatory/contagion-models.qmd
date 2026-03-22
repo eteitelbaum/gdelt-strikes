@@ -3,8 +3,7 @@ title: "Contagion Analysis: Regression Models"
 format: html
 ---
 
-Estimates the baseline LPM and institutional moderation models from the
-preregistered analysis plan.
+Estimates the baseline LPM and institutional moderation models.
 
 **Specification**:
 $$Y_{it} = \beta \cdot \text{NeighborStrike}_{i,t-1:t-2} + \alpha_i + \gamma_{c \times t} + \varepsilon_{it}$$
@@ -252,6 +251,71 @@ m_joint_mod <- feols(
 summary(m_joint_mod)
 ```
 
+---
+
+## Extended moderation models: both channels
+
+The models above interact institutional moderators only with the geographic
+neighbor treatment. The models below add interactions with `country_share` as
+well, testing whether institutions condition national contagion in addition to
+geographic contagion.
+
+```{r}
+#| label: m-freexp-ext
+
+m_freexp_ext <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * freexp_z +
+                 country_share_t1_t2 * freexp_z | gid_1 + week_start,
+  data    = analysis_decomp,
+  cluster = ~gid_1
+)
+
+summary(m_freexp_ext)
+```
+
+```{r}
+#| label: m-frassoc-ext
+
+m_frassoc_ext <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * frassoc_z +
+                 country_share_t1_t2 * frassoc_z | gid_1 + week_start,
+  data    = analysis_decomp,
+  cluster = ~gid_1
+)
+
+summary(m_frassoc_ext)
+```
+
+```{r}
+#| label: m-repression-ext
+
+m_repression_ext <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * repression_z +
+                 country_share_t1_t2 * repression_z | gid_1 + week_start,
+  data    = analysis_decomp,
+  cluster = ~gid_1
+)
+
+summary(m_repression_ext)
+```
+
+```{r}
+#| label: m-joint-mod-ext
+
+m_joint_mod_ext <- feols(
+  strike_onset ~ neighbor_strike_within_t1_t2 * freexp_z +
+                 neighbor_strike_within_t1_t2 * frassoc_z +
+                 neighbor_strike_within_t1_t2 * repression_z +
+                 country_share_t1_t2 * freexp_z +
+                 country_share_t1_t2 * frassoc_z +
+                 country_share_t1_t2 * repression_z | gid_1 + week_start,
+  data    = analysis_decomp,
+  cluster = ~gid_1
+)
+
+summary(m_joint_mod_ext)
+```
+
 ```{r}
 #| label: table-joint-moderation
 #| tbl-cap: "Joint moderation model: all three institutional moderators (ADM1 + week FEs)"
@@ -360,13 +424,19 @@ The baseline LPM with `country×week` FEs yields a null treatment effect, while
 `ADM1 + week` FEs yield a positive effect (~1.5 pp). To understand why, we
 decompose the apparent neighborhood effect into:
 
-- **Country-level contagion**: did any other region in the same country strike
-  in $t-1$ or $t-2$? (`country_strike_t1_t2`)
+- **Country-level contagion**: what share of other regions in the same country
+  struck in $t-1$ or $t-2$? (`country_share_t1_t2`) — normalized by the number
+  of regions so large countries do not mechanically score higher than small ones
 - **Neighborhood-specific diffusion**: does a geographic neighbor's strike
   predict onset *above and beyond* the country-level signal?
 
 ```{r}
 #| label: build-country-strike
+
+# Number of ADM1 units per country
+n_regions <- panel |>
+  distinct(gid_0, gid_1) |>
+  count(gid_0, name = "n_regions")
 
 # Country-week total strike count, then lagged
 country_weekly <- panel |>
@@ -374,13 +444,16 @@ country_weekly <- panel |>
   summarize(country_strike_count = sum(strike_onset), .groups = "drop")
 
 panel_decomp <- panel |>
+  left_join(n_regions, by = "gid_0") |>
   left_join(country_weekly, by = c("gid_0", "week_start")) |>
   arrange(gid_0, week_start) |>
   group_by(gid_0) |>
   mutate(
-    country_strike_t1    = dplyr::lag(country_strike_count, 1),
-    country_strike_t2    = dplyr::lag(country_strike_count, 2),
-    country_strike_t1_t2 = as.integer((country_strike_t1 + country_strike_t2) > 0)
+    country_count_t1     = dplyr::lag(country_strike_count, 1),
+    country_count_t2     = dplyr::lag(country_strike_count, 2),
+    # Normalized share: proportion of other regions striking, averaged t-1:t-2
+    country_share_t1_t2  = ((country_count_t1 + country_count_t2) / 2) /
+                             (n_regions - 1)
   ) |>
   ungroup()
 
@@ -388,20 +461,22 @@ analysis_decomp <- panel_decomp |>
   filter(
     !is.na(neighbor_strike_within_t1_t2),
     !is.na(strike_onset),
-    !is.na(country_strike_t1_t2)
+    !is.na(country_share_t1_t2),
+    n_regions > 1
   )
 
 cat("Decomposition sample:", nrow(analysis_decomp), "ADM1-weeks\n")
-cat("Country strike prevalence:",
-    round(mean(analysis_decomp$country_strike_t1_t2) * 100, 1), "%\n")
+cat("Mean country share striking:",
+    round(mean(analysis_decomp$country_share_t1_t2) * 100, 2), "%\n")
+cat("SD country share:", round(sd(analysis_decomp$country_share_t1_t2), 4), "\n")
 ```
 
 ```{r}
 #| label: m-country-only
 
-# M1: country-level contagion only
+# M1: country-level contagion only (share measure)
 m_country <- feols(
-  strike_onset ~ country_strike_t1_t2 | gid_1 + week_start,
+  strike_onset ~ country_share_t1_t2 | gid_1 + week_start,
   data    = analysis_decomp,
   cluster = ~gid_1
 )
@@ -427,7 +502,7 @@ summary(m_neighbor_aw)
 
 # M3: both together — does geographic neighbor add anything beyond country wave?
 m_decomp <- feols(
-  strike_onset ~ neighbor_strike_within_t1_t2 + country_strike_t1_t2 |
+  strike_onset ~ neighbor_strike_within_t1_t2 + country_share_t1_t2 |
     gid_1 + week_start,
   data    = analysis_decomp,
   cluster = ~gid_1
@@ -437,43 +512,26 @@ summary(m_decomp)
 ```
 
 ```{r}
-#| label: m-decomp-frassoc
-
-# M4: add frassoc moderation on the neighborhood term
-m_decomp_frassoc <- feols(
-  strike_onset ~ neighbor_strike_within_t1_t2 * frassoc_z +
-                 country_strike_t1_t2 | gid_1 + week_start,
-  data    = analysis_decomp,
-  cluster = ~gid_1
-)
-
-summary(m_decomp_frassoc)
-```
-
-```{r}
 #| label: table-decomp
 #| tbl-cap: "National vs. neighborhood contagion decomposition"
 
 decomp_models <- list(
-  "(1) Country"        = m_country,
-  "(2) Neighbor"       = m_neighbor_aw,
-  "(3) Decomposition"  = m_decomp,
-  "(4) + frassoc"      = m_decomp_frassoc
+  "(1) Country"       = m_country,
+  "(2) Neighbor"      = m_neighbor_aw,
+  "(3) Decomposition" = m_decomp
 )
 
 decomp_coef <- c(
-  "neighbor_strike_within_t1_t2"         = "Neighbor strike (t-1, t-2)",
-  "country_strike_t1_t2"                 = "Country strike (t-1, t-2)",
-  "frassoc_z"                            = "Freedom of assoc. (z)",
-  "neighbor_strike_within_t1_t2:frassoc_z" = "Neighbor strike × Assoc."
+  "neighbor_strike_within_t1_t2" = "Neighbor strike (t-1, t-2)",
+  "country_share_t1_t2"          = "Country share striking (t-1, t-2)"
 )
 
 decomp_rows <- tribble(
-  ~term,               ~"(1) Country", ~"(2) Neighbor", ~"(3) Decomposition", ~"(4) + frassoc",
-  "ADM1 FE",           "Yes",          "Yes",            "Yes",                "Yes",
-  "Week FE",           "Yes",          "Yes",            "Yes",                "Yes"
+  ~term,    ~"(1) Country", ~"(2) Neighbor", ~"(3) Decomposition",
+  "ADM1 FE", "Yes",          "Yes",            "Yes",
+  "Week FE", "Yes",          "Yes",            "Yes"
 )
-attr(decomp_rows, "position") <- c(8, 9)
+attr(decomp_rows, "position") <- c(4, 5)
 
 modelsummary(
   decomp_models,
@@ -585,7 +643,8 @@ analysis_val <- panel_val |>
 
 analysis_val_decomp <- panel_val_decomp |>
   filter(!is.na(neighbor_strike_within_t1_t2),
-         !is.na(country_strike_t1_t2))
+         !is.na(country_share_t1_t2),
+         n_regions > 1)
 
 cat("Validated outcome prevalence:",
     round(mean(analysis_val$strike_onset_val) * 100, 2), "%\n")
@@ -616,7 +675,7 @@ summary(m_val_aw)
 #| label: validated-decomp
 
 m_val_decomp <- feols(
-  strike_onset_val ~ neighbor_strike_within_t1_t2 + country_strike_t1_t2 |
+  strike_onset_val ~ neighbor_strike_within_t1_t2 + country_share_t1_t2 |
     gid_1 + week_start,
   data    = analysis_val_decomp,
   cluster = ~gid_1
@@ -624,18 +683,61 @@ m_val_decomp <- feols(
 
 modelsummary(
   list(
-    "Full sample\n(country×week)" = m_baseline,
-    "Full sample\n(week FE)"      = m_val_aw,
-    "Validated only\n(country×week)" = m_val_baseline,
-    "Validated only\n(week FE)"   = m_val_aw,
-    "Validated: decomp"           = m_val_decomp
+    "Full sample\n(country×week)"    = m_baseline,
+    "Full sample\n(week FE)"         = m_val_aw,
+    "Validated\n(country×week)"      = m_val_baseline,
+    "Validated\n(week FE)"           = m_val_aw,
+    "Validated\ndecomp"              = m_val_decomp
   ),
   coef_map = c(
     "neighbor_strike_within_t1_t2" = "Neighbor strike (t-1, t-2)",
-    "country_strike_t1_t2"         = "Country strike (t-1, t-2)"
+    "country_share_t1_t2"          = "Country share striking (t-1, t-2)"
   ),
   stars   = c("*" = .1, "**" = .05, "***" = .01),
   gof_map = c("nobs", "r.squared"),
   output  = "gt"
 )
+```
+
+---
+
+## Save model objects
+
+```{r}
+#| label: save-models
+#| message: false
+
+out_dir <- here("outputs/models/contagion")
+
+# Main paper models
+saveRDS(m_baseline,    file.path(out_dir, "m_baseline.rds"))
+saveRDS(m_country,     file.path(out_dir, "m_country.rds"))
+saveRDS(m_neighbor_aw, file.path(out_dir, "m_neighbor_aw.rds"))
+saveRDS(m_decomp,      file.path(out_dir, "m_decomp.rds"))
+saveRDS(m_freexp,      file.path(out_dir, "m_freexp.rds"))
+saveRDS(m_frassoc,     file.path(out_dir, "m_frassoc.rds"))
+saveRDS(m_repression,  file.path(out_dir, "m_repression.rds"))
+saveRDS(m_joint_mod,      file.path(out_dir, "m_joint_mod.rds"))
+saveRDS(m_freexp_ext,     file.path(out_dir, "m_freexp_ext.rds"))
+saveRDS(m_frassoc_ext,    file.path(out_dir, "m_frassoc_ext.rds"))
+saveRDS(m_repression_ext, file.path(out_dir, "m_repression_ext.rds"))
+saveRDS(m_joint_mod_ext,  file.path(out_dir, "m_joint_mod_ext.rds"))
+
+# Robustness
+saveRDS(m_lag1,        file.path(out_dir, "m_lag1.rds"))
+saveRDS(m_lag2,        file.path(out_dir, "m_lag2.rds"))
+saveRDS(m_logit,       file.path(out_dir, "m_logit.rds"))
+saveRDS(m_twoway,      file.path(out_dir, "m_twoway.rds"))
+
+# Validated-only
+saveRDS(m_val_baseline, file.path(out_dir, "m_val_baseline.rds"))
+saveRDS(m_val_decomp,   file.path(out_dir, "m_val_decomp.rds"))
+
+# Cross-border diffusion
+saveRDS(m_cross_cw,  file.path(out_dir, "m_cross_cw.rds"))
+saveRDS(m_cross_aw,  file.path(out_dir, "m_cross_aw.rds"))
+saveRDS(m_joint_cw,  file.path(out_dir, "m_joint_cw.rds"))
+saveRDS(m_joint_aw,  file.path(out_dir, "m_joint_aw.rds"))
+
+cat("Models saved to", out_dir, "\n")
 ```

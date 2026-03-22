@@ -1,0 +1,3 @@
+## Intro
+
+Strike waves are one of the most heavily studied phenomena of modern labor history. Periods of intense collective action sweep across industries, regions, and sometimes entire countries before receding, only to re-emerge when economic or political conditions shift again. Scholars have documented this pattern across industrial societies for more than a century [@shorter1974; @cronin1987; @franzosi1989].

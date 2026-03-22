@@ -1,0 +1,469 @@
+---
+title: | 
+  The Spatial Diffusion of Labor Strikes
+subtitle: |
+  Evidence from Global Subnational Event Data
+short-title: Strike Diffusion
+published: "Prepared for the APSA Labor Group's Comparative Politics Workshop."  
+date: March 20, 2026
+code-repo: "Access the code, data, and analysis at <https://github.com/eteitelbaum/gdelt-strikes.git>"
+author: 
+  - name: Emmanuel Teitelbaum
+    email: ejt@gwu.edu
+    orcid: 0000-0001-7089-0588
+    title: Associate Professor 
+    affiliations:
+      - id: gwu-ps
+        name: George Washington University
+        department: Department of Political Science
+    #attributes: 
+    #  corresponding: true
+abstract: |
+  Theoretical accounts of labor mobilization emphasize demonstration effects and geographic diffusion, yet quantitative research rarely employs identification strategies that distinguish genuine contagion from common shocks. I examine the spatial structure of strike diffusion using a subnational panel of first-level administrative units observed weekly from 2015 to 2025, drawing on 11,503 validated strike events geocoded from GDELT to ADM1 boundaries. Two-way fixed effects models with unit and country-by-week fixed effects absorb both time-invariant confounders and national-level shocks. I find that regions with a striking neighbor are 3.5 times more likely to strike in the raw data, but this association fully disappears once national dynamics are controlled. Decomposing geographic and national channels explicitly reveals large national contagion effects, while geographic neighbor exposure adds nothing once country-level activity is controlled. Exploratory evidence from V-Dem suggests that freedom of expression amplifies national waves while freedom of association strengthens geographic transmission. These findings suggest that strike contagion, unlike civil conflict spillovers, operates at the national rather than geographic level, and that institutional factors such as freedom of expression and association may shape the structure of national waves rather than geographic diffusion per se.
+keywords:
+  - labor strikes
+  - strike diffusion
+  - spatial contagion
+  - subnational panel data
+  - GDELT
+  - collective action
+thanks: | 
+  Early draft. Please do not circulate or cite.
+#funding-info: | 
+#conflicts: |
+#  We have no known conflict of interest to disclose.
+anonymized: false
+#word-count: "6,331"
+format: 
+  working-paper-pdf:
+    keep-tex: true
+  #hikmah-manuscript-docx: default
+  #academic-typst: default
+execute:
+  echo: false
+  warning: false
+  message: false
+bibliography: strikes.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source(here::here("papers/contagion/helpers/figures.R"))
+source(here::here("papers/contagion/helpers/tables.R"))
+```
+
+# Introduction
+
+Strikes are not isolated events. They cluster in time and space, building into waves that sweep across industries, regions, and sometimes entire countries. Historical accounts of major labor mobilizations, including the wave of sit-down strikes in the United States in 1937, the global strike wave of 1968 to 1972, and the Indian general strikes of the 2010s, describe contagion-like processes in which mobilization in one location appears to inspire or enable mobilization elsewhere. Yet while strike waves are well-documented descriptively, the causal mechanisms underlying their spatial structure remain poorly understood.
+
+Do strikes in nearby regions actually *cause* subsequent strikes elsewhere? Or does spatial clustering merely reflect the fact that neighboring regions share industries, unions, employer associations, and contract cycles, common conditions that produce correlated behavior without any causal transmission? And if geographic diffusion does occur, is it conditioned by the political and organizational environment in which workers and employers operate?
+
+These questions sit at the intersection of three literatures. The conflict contagion literature has developed rigorous subnational panel methods for identifying spatial spillovers, with careful attention to distinguishing genuine diffusion from common shocks [@buhaug2008; @braithwaite2010]. The protest diffusion literature documents spatial clustering of contentious action but rarely achieves clean causal identification [@beissinger2002], while the strike literature offers rich historical accounts of wave dynamics but limited systematic cross-national evidence [@shorter1974; @franzosi1995].
+
+This paper brings the identification toolkit of the conflict contagion literature to bear on the spatial diffusion of labor strikes. I construct a subnational panel of first-level administrative units (ADM1) observed weekly across 181 countries over 2015–2025, using strike events from the Global Database of Events, Language and Tone (GDELT) geocoded to administrative boundaries. I estimate two-way fixed effects models that absorb unit-level baseline differences and national-level weekly shocks, asking whether geographic neighbor exposure predicts strike onset above and beyond what is explained by common national dynamics.
+
+The central finding is that the raw spatial clustering of strikes fully disappears once national dynamics are controlled. Regions with a striking neighbor are 3.5 times more likely to strike in the raw data, but this association is entirely absorbed by country-by-week fixed effects. Decomposing the national and geographic channels explicitly, I find that strike contagion operates at the national level. When other regions in the same country are striking, a focal region is substantially more likely to strike. This is not because geographic proximity transmits the signal, but because a common national dynamic drives coordinated action. Geographic proximity is not a conduit for strike diffusion. It is a marker of shared exposure to national waves.
+
+I further examine whether institutional context conditions this pattern. Exploratory evidence from V-Dem moderators suggests that freedom of expression produces nationally homogeneous waves while freedom of association is associated with more geographically structured diffusion, though these findings are identified primarily from between-country variation.
+
+The paper proceeds as follows. Section 2 develops the theoretical framework. Section 3 describes data and measurement. Section 4 presents the empirical strategy. Section 5 reports main results. Section 6 presents robustness checks. Section 7 discusses implications and limitations.
+
+# Theory
+
+The historical patterns documented in the comparative labor literature persist in contemporary cross-national data. Figure 1a plots weekly strike prevalence as the number of ADM1 regions recording more than one strike event per week in the GDELT database.^[Section 4 discusses the methods used to extract these data in detail.] The smoothed trend reveals that, rather than occurring at a steady rate, strike activity concentrates into distinct episodes in which the number of regions simultaneously experiencing strikes rises well above the baseline. Figure 1b shows the prevalence of strikes among regions with and without an actively striking neighbor in the prior two weeks. Regions with an actively striking neighbor experienced strikes at a rate of 4.9%, compared to 1.4% for unexposed regions, a 3.5-fold difference. The phenomenon that scholars have traced across industrial societies for more than a century remains visible, at global scale, in the present day.
+
+What produces this clustering is less clear. The same observational patterns are consistent with two distinct causal accounts: one in which strikes spread through direct transmission between neighboring regions, and one in which workers across regions respond independently to shared national stimuli without directly influencing one another. The patterns in Figure 1 are identical under both mechanisms, and distinguishing between them requires both a theoretical argument about which is more likely to govern labor strikes and an empirical strategy capable of separating them.
+
+I distinguish two mechanisms that could produce the patterns in Figure 1. *Geographic contagion* is a step-by-step transmission process in which strikes spread between spatially adjacent units through direct demonstration effects. Workers observe a neighboring region striking and update their beliefs about the feasibility and likely costs of collective action, lowering the threshold for action in their own region [@biggs2002; @granovetter1978]. *National contagion* is coordinated mobilization driven by common national stimuli rather than sequential geographic diffusion. Union federations, political events, and national media simultaneously shift strike propensity across all regions, producing apparent clustering without any direct transmission between them.
+
+McAdam, Tarrow, and Tilly [-@mcadam2008] provide a precise vocabulary for this distinction, contrasting *relational* mechanisms, in which transmission runs through direct ties between actors, with *non-relational* mechanisms, in which actors respond independently to shared stimuli. Geographic contagion is relational while national contagion is non-relational. As Oliver and Myers [-@oliver2003] show, empirical models that cannot separate these two processes will systematically overestimate geographic diffusion effects. I argue that for labor strikes, national contagion is the predominant mechanism. I further hypothesize that the relative weight of the two mechanisms varies with institutional context, with the structure of information environments and associational freedoms conditioning the spatial structure through which national mobilization propagates.
+
+```{r}
+#| label: fig-puzzle
+#| fig-cap: "Strike activity and neighbor exposure."
+#| fig-width: 7
+#| fig-height: 3
+
+fig_1
+```
+
+## The National Foundations of Strike Waves
+
+The comparative-historical literature on strike waves consistently finds that elevated strike activity sweeps multiple regions and industries simultaneously rather than radiating outward from a geographic source. Shorter and Tilly's [-@shorter1974] analysis of French strike waves, Cronin's [-@cronin1987] documentation of the great British waves of 1871 to 1920, and Franzosi's [-@franzosi1989; -@franzosi1995] analyses of Italian strikes all conclude that major waves are nationally synchronized, driven by macro-level political and economic cycles that create the same mobilization moment across regions at once. Strike waves are synchronized in part because the relevant information, about employer resistance and political opportunity, travels through national media and union networks rather than through geographic proximity [@biggs2002]. Broad shifts in political opportunity generate mobilization across sectors and regions simultaneously, producing spatial clustering as a byproduct of common national exposure rather than geographic spread [@tarrow2011].
+
+Economic theories of strikes reinforce the primacy of national dynamics from a different perspective. In the canonical bargaining model of strikes, strike probability is a function of the gap between worker expectations and firm capacity to pay, a gap driven by macroeconomic conditions that are national in scope [@ashenfelter1969; @kennan1993; @card1990]. When unexpected shifts in profitability, inflation, or real wages affect all firms in a country simultaneously, strike timing will be synchronized across regions not because workers are imitating each other but because all face the same economic environment. This synchronization has been documented empirically at the macro level [@rees1952] and extended cross-nationally, with the late-1960s and early-1970s strike waves across France, Italy, Britain, and the United States attributed to shared macroeconomic and political conditions rather than sequential contagion [@hibbs1976a; @hibbs1978].
+
+## The Limits of Geographic Contagion
+
+An established literature on the spatial diffusion of collective action finds that geographic proximity predicts contagion, but largely for violent and civil conflict rather than for labor organizing. Robust neighborhood effects that survive structural controls have been documented in studies of civil war onset [@buhaug2008], with regional conflict environments shaping civil war onset independently of domestic conditions [@gleditsch2007]. The mechanisms in these cases are local in character, including rebel group expansion across borders, refugee flows that import instability, ethnic networks spanning administrative boundaries, and competition over natural resources that straddle frontiers.
+
+None of these mechanisms translate straightforwardly to labor strikes. The organizational infrastructure that translates mobilization signals into strike action, including labor unions, collective bargaining agreements, and labor law, operates overwhelmingly at the national level [@shorter1974; @franzosi1995]. A union federation's decision to call a general strike, or a government's announcement of austerity measures, creates the same organizational moment for workers in every region simultaneously. Geographic adjacency between administrative units adds little to this national signal.
+
+Even in the nonviolent protest literature, geographic neighbor effects are weaker and more conditional than in conflict studies. The geographic diffusion of nonviolent campaigns has been shown to depend on shared political opportunity structures, with spatial proximity contributing little once those structures are controlled [@gleditsch2017]. Genuine geographic diffusion requires active organizational brokerage, with new ties deliberately constructed to link previously isolated actors, and without such linkages what appears to be geographic spread is better understood as simultaneous response to a common environment [@tarrow2005].
+
+## Institutional Conditioning
+
+Even if national contagion predominates on average, the spatial distribution of nationally-driven mobilization may vary with the institutional context in which workers and employers operate. I consider three dimensions of institutional context that may condition how strike signals travel: freedom of expression, freedom of association, and state repression.
+
+Freedom of expression shapes the information infrastructure through which national strike signals reach workers. Where press freedom is strong and media access is broad, information about strikes travels through national broadcast channels, reaching workers in all regions simultaneously regardless of their geographic position. Collective violence has been shown to diffuse along media distribution networks rather than through geographic proximity [@myers2000], and the same logic applies to strike news. Where national media delivers the mobilization signal everywhere at once, no region needs a striking neighbor to be activated, and the geographic structure of strike waves should be correspondingly attenuated.
+
+Freedom of association shapes the organizational infrastructure through which workers translate national mobilization signals into local action. Where associational rights are strong, dense union networks and civil society organizations sustain direct linkages between workers, but those networks are often locally embedded, organized at the plant, district, or regional level rather than exclusively through national federations. Where such locally structured networks are the primary conduit for strike information and coordination [@biggs2002], geographic proximity becomes more rather than less important for how the national signal propagates. Higher freedom of association should therefore amplify the geographic structure of strike waves, producing more spatially clustered national episodes.
+
+State repression raises the costs of collective action and should suppress the translation of strike signals into local mobilization. Where states have the capacity and will to suppress collective action, workers may observe strike activity nearby or perceive a national mobilization wave and nonetheless not act, because the expected costs of participation outweigh the informational update from the strike signal. This logic has been demonstrated for conflict contagion [@braithwaite2010], and the parallel argument for strikes suggests that higher repression should dampen both geographic and national transmission.
+
+## Expectations
+
+The arguments developed above yield five expectations, two concerning the main contagion effects and three concerning institutional conditioning. National contagion should be positive and substantial, with the probability that any given region experiences strike activity rising as a greater share of a country's regions are already mobilized, reflecting the common national mobilization environment. Geographic contagion, by contrast, should be negligible once national dynamics are controlled, because spatial proximity between administrative units adds little explanatory power beyond the national signal that is the primary conduit for strike transmission.
+
+The institutional conditioning arguments generate three further expectations. Higher freedom of expression should attenuate the geographic neighbor effect, as broadcast media substitutes for geographic proximity as the primary conduit for strike signals. Higher freedom of association should amplify it, as locally embedded organizational networks reinforce the role of proximity in transmitting mobilization. The opposite signs of these two predictions reflect a single coherent theoretical claim: the two institutions route the same national mobilization signal through different infrastructures, one that flattens geographic structure and one that reinforces it. Higher repression should dampen the translation of strike signals into local mobilization through both channels.
+
+
+# Data
+
+## Strike Events: GDELT
+
+The primary data source is the Global Database of Events, Language and Tone (GDELT), a real-time database that codes news articles from global media outlets into structured event records following the CAMEO coding scheme [@leetaru2013a]. I extract all events with CAMEO event codes beginning with "143" (labor strikes and related actions) for the period January 2015 to September 2025, yielding approximately 30,900 events prior to filtering.
+
+Each GDELT event record includes the action date, geographic coordinates (`ActionGeo_Lat`, `ActionGeo_Long`), and a precision indicator. I retain only events with valid coordinates and precision codes indicating subnational geographic assignment. I spatially join event coordinates to GADM version 4.1 administrative boundaries using `sf::st_join()` in R, assigning each event to its containing ADM1 polygon. This coordinate-based matching achieves a 93% assignment rate.
+
+**Coverage and bias.** GDELT's coverage is uneven across countries and time. It relies on digitized English-language and multilingual news sources, which generates systematic undercoverage in regions with limited media presence, non-Latin scripts, or restricted press access. The resulting panel therefore captures a selected subset of strike activity, specifically events deemed newsworthy enough to receive media coverage. This is a scope condition rather than a fatal flaw. The analysis speaks to observable, newsworthy strikes rather than all strike activity. Section 7 discusses the implications for interpretation.
+
+### Panel Construction
+
+I aggregate events to an ADM1-week panel spanning 2015–2025. The unit of observation is an administrative region-week. The outcome variable is a binary indicator for strike *onset*, equal to one if at least one strike event was recorded in the ADM1 unit during week $t$, and zero otherwise.[^onset]
+
+[^onset]: "Onset" follows the epidemiological convention used in the conflict literature for first events within a defined window. In this context, it captures whether any new strike activity commenced in a region-week rather than whether activity was ongoing. The baseline onset rate across all ADM1-weeks is 1.4%.
+
+The full panel includes [N] ADM1 units across [C] countries, observed over [W] weeks, yielding [R] unit-week observations. I exclude island ADM1 units with no contiguous within-country neighbors, as they cannot receive geographic exposure and would contribute only unexposed observations to the neighbor treatment variable.
+
+**Figure 2** maps cumulative strike prevalence across ADM1 regions, showing the number of weeks with recorded strike activity. Strike activity is concentrated in South Asia, sub-Saharan Africa, and parts of Europe, reflecting both true geographic variation and GDELT's media coverage patterns.
+
+```{r}
+#| label: fig-data
+#| fig-cap: "Cumulative strike prevalence across ADM1 regions, 2015--2025."
+#| fig-width: 7
+#| fig-height: 3.2
+
+fig_2
+```
+
+## Neighbor Relationships
+
+I define geographic neighbors as ADM1 units sharing a border within the same country. I compute topological adjacency using `spdep::poly2nb()` on GADM ADM1 polygons, separately identifying within-country and cross-border adjacency. The main analysis uses within-country neighbors. Cross-border adjacency is examined as an exploratory extension.
+
+**Table A1** (appendix) summarizes the distribution of neighbor counts across ADM1 units.
+
+## Treatment Variable
+
+The primary treatment variable is `neighbor_strike_t1_t2`, a binary indicator equal to one if at least one within-country geographic neighbor had a strike onset in week $t-1$ or week $t-2$.
+
+Neighbor strike exposure is rare. Only 7.9% of ADM1-weeks have an exposed neighbor. As shown in Figure 1b, however, exposure is strongly associated with onset in the unconditional data. Exposed regions strike at 4.9% versus 1.4% for unexposed regions, a 3.5-fold difference. The empirical strategy addresses whether this raw association survives conditioning on common shocks.
+
+## National Contagion Variable
+
+For the decomposition analysis (Section 5.2), I construct `country_share_t1_t2`, a normalized country-level exposure measure equal to the proportion of other ADM1 regions in the same country with a strike onset, averaged over weeks $t-1$ and $t-2$, and normalized by $(N_c - 1)$ where $N_c$ is the number of ADM1 units in country $c$. This normalization ensures the measure is not mechanically larger for countries with more administrative units.
+
+## Institutional Moderators: V-Dem
+
+I use three country-year indicators from the Varieties of Democracy (V-Dem) project:
+
+- **Freedom of expression** (`v2x_freexp_altinf`), measuring the extent of freedom of expression and media access
+- **Freedom of association** (`v2x_frassoc_thick`), measuring the extent of freedom of association and civil society participation
+- **State repression** (`v2x_clphy`), measuring physical violence and intimidation by state agents
+
+All three indicators are standardized (z-scored) before entering interaction models, so the main treatment effect is interpreted at the sample mean of each moderator.
+
+
+# Empirical Strategy
+
+The analysis tests the theoretical expectations through three specifications. The first asks whether geographic neighbor exposure predicts strike onset once national co-movement is absorbed, using a two-way fixed effects design that pairs ADM1 unit fixed effects with country-by-week fixed effects. The country-by-week fixed effects are the key identifying restriction, absorbing all within-country variation in a given week without requiring the researcher to specify which national factors matter. A second specification estimates geographic and national contagion simultaneously by replacing the country-by-week fixed effect with an explicit measure of country-level strike activity, allowing both effects to be compared directly in the same model. A third specification then interacts the treatment variables with V-Dem indicators of freedom of expression, freedom of association, and state repression to test whether institutional context conditions the spatial structure of diffusion.
+
+## Two-Way Fixed Effects Model
+
+To test whether geographic neighbor exposure predicts strike onset once common national dynamics are removed, I estimate:
+
+$$Y_{it} = \beta \cdot \text{NeighborStrike}_{i,t-1:t-2} + \alpha_i + \gamma_{c \times t} + \varepsilon_{it}$$
+
+```{=latex}
+\noindent
+```
+
+where $Y_{it}$ is the binary strike onset indicator for ADM1 unit $i$ in week $t$. The treatment variable $\text{NeighborStrike}_{i,t-1:t-2}$ is a binary indicator equal to one if at least one within-country geographic neighbor recorded a strike onset in week $t-1$ or $t-2$. I use two lags to capture a plausible demonstration-effect window while keeping the treatment predetermined with respect to the current period's outcome.
+
+I estimate this as a linear probability model (LPM) via `feols` in R [@berge2018]. LPM is preferred over logit in this setting because maximum likelihood estimators with many fixed effects suffer from the incidental parameters problem, which does not affect OLS [@lancaster2000; @wooldridge2010]. Coefficients are directly interpretable as marginal effects on the probability of onset. Given the low baseline onset rate of 1.4%, I report a bias-corrected logit robustness check using the `alpaca` package [@fernandez-val2016] (see Table A2). The substantive conclusions are unchanged.
+
+Standard errors are clustered at the ADM1 level to account for serial correlation within units over time. Ignoring within-unit serial correlation in panel settings leads to substantially understated standard errors [@bertrand2004], and clustering at the ADM1 level is appropriate because geographic neighbor exposure varies at that level [@colincameron2015].
+
+The country-by-week fixed effect represents a more demanding identification strategy than is typical in the conflict contagion literature, which generally uses logit with parametric controls for national conditions such as democracy, GDP per capita, and population [@buhaug2008; @gleditsch2017]. Rather than specifying which national factors to control for, the saturated fixed effect absorbs all of them simultaneously. This approach has been standard in the international trade literature, where country-by-time fixed effects absorb unobservable common shocks without requiring the researcher to model their form [@baier2007; @head2014]. The lagged-treatment design also has methodological precedent in the study of historical collective action: Aidt, Leon, and Satchell [-@aidt2022a] and Aidt and Leon [-@aidt2022] employ a similar subnational spatial panel approach to study the geographic diffusion of the English Swing Riots of 1830--31. The present study extends this design to contemporary global data and, unlike the Swing Riots case, finds no geographic contagion once national dynamics are controlled. An alternative framework would be an explicit spatial lag model, as in Arezki et al. [-@arezki2024], who study protest contagion across 200 countries using a spatial autoregressive specification; however, the lagged-treatment TWFE approach is preferred here because the predetermined neighbor indicator avoids the simultaneity problem inherent in contemporaneous spatial lags.
+
+## National vs. Geographic Decomposition
+
+The central argument of the paper is that strike contagion operates at the national rather than geographic level, and that the raw geographic association in the data reflects common national dynamics rather than direct transmission between neighboring regions. Testing this argument requires estimating national and geographic contagion simultaneously. I therefore replace the country-by-week fixed effect with an explicit measure of country-level strike activity, constructing a specification that places both channels in the same model:
+
+$$Y_{it} = \beta_1 \cdot \text{NeighborStrike}_{i,t-1:t-2} + \beta_2 \cdot \text{CountryShare}_{i,t-1:t-2} + \alpha_i + \gamma_t + \varepsilon_{it}$$
+
+```{=latex}
+\noindent
+```
+
+where $\gamma_t$ is a week fixed effect common to all countries and $\text{CountryShare}_{i,t-1:t-2}$ is the proportion of other ADM1 regions in the same country with a strike onset in $t-1:t-2$, normalized by $(N_c - 1)$ to remove any mechanical relationship with country size. This specification estimates national contagion ($\beta_2$) and the geographic neighbor effect net of national activity ($\beta_1$) simultaneously. The parametric control is less assumption-free than the saturated fixed effect but enables the decomposition that the saturated approach forecloses. If the raw geographic association reflects national rather than geographic dynamics, as the theoretical framework predicts, $\beta_2$ should be large and positive while $\beta_1$ collapses toward zero.
+
+## Institutional Moderation
+
+The third set of expectations concerns whether institutional context conditions the spatial structure of diffusion. To test these, I interact the neighbor strike treatment with V-Dem indicators:
+
+$$Y_{it} = \beta_1 \cdot \text{NeighborStrike}_{it} + \beta_2 \cdot \text{Institution}_{ct} + \beta_3 \cdot (\text{NeighborStrike}_{it} \times \text{Institution}_{ct}) + \alpha_i + \gamma_t + \varepsilon_{it}$$
+
+```{=latex}
+\noindent
+```
+
+These specifications draw on cross-national variation in institutional context to test whether the structure of diffusion varies with the political environment in which workers operate. I use ADM1 and week fixed effects with $\text{CountryShare}$ as a control for national waves, identifying the moderation effects primarily from between-country differences in institutional context. The estimates are therefore best read as descriptive of cross-national heterogeneity rather than within-country causal moderation. All V-Dem indicators are standardized so that the main treatment coefficient is interpreted at the sample mean of each moderator.
+
+
+# Results
+
+The analysis proceeds in three stages. First, I estimate the baseline effect of geographic neighbor strike exposure using a two-way fixed effects strategy that absorbs common national shocks. Second, I decompose the apparent neighborhood effect into national and geographic channels. Third, I examine whether institutional context conditions the geographic structure of strike contagion.
+
+## Geographic Neighbor Exposure
+
+Table 1 presents baseline results from the ADM1 and country-by-week fixed effects model. Geographic neighbor strike exposure does not significantly predict strike onset once common within-country shocks are absorbed, a striking result given the raw association (see Figure 1). Country-by-week fixed effects fully absorb this association, indicating the raw correlation reflects common national dynamics rather than geographic diffusion.
+
+```{r}
+#| tbl-cap: "Baseline specification: neighbor strike exposure and strike onset"
+#| tbl-pos: "H"
+#| echo: false
+#| output: asis
+
+etable(
+  tbl_baseline,
+  dict        = coef_dict,
+  signif.code = c("*" = .1, "**" = .05, "***" = .01),
+  fitstat     = ~ n + r2,
+  style.tex   = etable_style,
+  tex         = TRUE
+)
+```
+
+Examining the two lags separately sharpens the picture. The t−1 lag is negative and marginally significant (β = −0.006, p = 0.036), while the t−2 lag is null. Rather than pointing to a modest diffusion effect at one lag, the negative t−1 coefficient suggests a displacement or substitution dynamic in which the focal region becomes *less* likely to follow immediately once a neighboring region strikes, a pattern discussed further below.
+
+## National vs. Neighborhood Decomposition
+
+Table 2 decomposes geographic and national contagion by replacing the country-by-week fixed effect with the country strike share measure alongside the geographic neighbor indicator. Column (1) establishes that national-level contagion is large and highly significant. A one percentage-point increase in the country strike share raises the focal region's onset probability by 0.66 percentage points, a near-doubling of onset risk at a one-standard-deviation increase, and national contagion alone explains 6.3% of within-unit variance, a substantial share given the sparseness of the outcome.
+
+```{r}
+#| tbl-cap: "National vs. neighborhood decomposition"
+#| tbl-pos: "H"
+#| echo: false
+#| output: asis
+
+etable(
+  tbl_decomposition,
+  dict        = coef_dict,
+  signif.code = c("*" = .1, "**" = .05, "***" = .01),
+  fitstat     = ~ n + r2,
+  style.tex   = etable_style,
+  tex         = TRUE
+)
+```
+
+Column (2) isolates the geographic neighbor effect. In the absence of controls for national activity, having a striking neighbor is positive and significant (+1.5 percentage points, p < 0.001), consistent with prior literature on geographic diffusion.
+
+However, column (3) is the key specification. When both measures are included simultaneously, the national share coefficient is unchanged (+0.665, p < 0.001) while the geographic neighbor effect reverses sign (β = −0.004, p = 0.035). Once national activity is controlled, having a geographically adjacent neighbor strike slightly reduces the focal region's onset probability.
+
+The contrast in explanatory power is stark. National contagion explains 63 times more within-unit variance than geographic neighbor exposure (within R² = 0.063 versus 0.001). The 1.5 percentage-point neighborhood effect in column (2) is entirely attributable to national wave dynamics. Workers in the same country tend to strike together not because geographic proximity transmits the mobilization signal, but because a common national dynamic drives coordinated action.[^neighbor-caution]
+
+[^neighbor-caution]: The negative coefficient on the geographic neighbor indicator should be interpreted with caution. It is identified from the narrow set of cases where a region's neighbors diverge from national trends, a relatively rare occurrence by construction, and is therefore estimated from thinner variation than the country share coefficient.
+
+## Institutional Moderation
+
+Table 3 examines whether institutional context conditions the geographic structure of strike waves. I interact the neighbor strike treatment and the country share measure with three V-Dem indicators (freedom of expression, freedom of association, and state repression), entered individually and jointly, using ADM1 and week fixed effects with country share as a parametric control for national waves.
+
+```{r}
+#| tbl-cap: "Institutional moderation of geographic and national contagion"
+#| tbl-pos: "H"
+#| echo: false
+#| output: asis
+
+etable(
+  tbl_moderation_ext,
+  dict        = coef_dict,
+  signif.code = c("*" = .1, "**" = .05, "***" = .01),
+  fitstat     = ~ n + r2,
+  style.tex   = etable_style,
+  tex         = TRUE
+)
+```
+
+Institutional context does not condition how strongly national strike waves propagate. The country share interactions are null across all three moderators and in the joint model, and any conditioning operates exclusively on the geographic channel. When modeled jointly, freedom of expression attenuates the neighbor strike effect (β = −0.009, p = 0.073) while freedom of association amplifies it (β = +0.010, p = 0.062), with effects that are nearly equal in magnitude and opposite in sign. Repression is null throughout. When modeled separately, these effects are attenuated because freedom of expression and freedom of association are positively correlated and their opposing effects partially cancel when either is included in isolation.
+
+In countries with strong freedom of expression, information about strikes spreads rapidly through national media, enabling workers in distant regions to coordinate simultaneously rather than through geographic proximity, producing nationally homogeneous strike waves with little geographic gradient. In countries with strong freedom of association, dense union networks are locally embedded at the plant, district, or regional level, creating organizational infrastructure that reinforces the role of geographic proximity in transmitting mobilization signals, producing geographically structured national episodes rather than uniform waves. In short, freedom of expression produces nationally homogeneous strike waves while freedom of association produces geographically structured ones.
+
+These results must be qualified by the decomposition finding. Since the geographic neighbor effect approaches zero and turns negative once country-level contagion is controlled, the moderation results are best understood as capturing the spatial structure of nationally-driven mobilization rather than true neighborhood diffusion. Institutions shape how national strike waves distribute across space but do not appear to generate or amplify geographic transmission as an independent mechanism.
+
+## Robustness
+
+The null geographic contagion result is robust across alternative specifications. Two-way clustering and logistic regression leave the main findings unchanged (Table A2). Results also replicate in the validated-location subsample, which restricts to strike events with confirmed ADM1 geocodes (Tables A3 and A4), with the null geographic neighbor effect and large national contagion both intact. Cross-border neighbor exposure is null across all specifications (Table A5), consistent with the view that strike contagion is bounded by national institutional frameworks.
+
+# Discussion
+
+The results establish three robust findings: geographic neighbor exposure has no independent effect on strike onset once national dynamics are controlled; national contagion is large and explains orders of magnitude more within-unit variance than geographic proximity; and civil liberties shape the spatial structure of nationally-driven mobilization without conditioning its overall strength. Together these findings suggest that future research should focus on understanding what produces national synchronization and how institutions determine whether that synchronization takes a geographically uniform or spatially clustered form. This discussion highlights three questions related to this task. What drives national strike waves and what would it take to study them? Why do institutional conditioning effects appear modest and difficult to pin down? And does the contagion process look different for different types of strikes?
+
+## Why Institutional Conditioning Is Hard to Pin Down
+
+While the institutional moderation results are theoretically coherent, the estimates are limited by two key factors. The first is a fundamental measurement issue. GDELT's media-derived event detection is systematically thinner in high-repression environments. In countries where the state actively restricts press access, suppresses protest reporting, or controls media outlets, the observable strike record is likely a highly selected sample of actual labor activity, capturing only the most egregious, internationally newsworthy episodes rather than the full distribution of strike behavior that the theory targets. Repression both suppresses the mobilization the analysis is trying to detect and degrades the measurement instrument simultaneously. As a result, a null result in this context cannot be interpreted as a genuine null.
+
+A second problem affects all three V-Dem moderators. Freedom of expression, freedom of association, and state repression are measured annually at the country level and move very slowly over time. As a result, identifying variation in the interaction terms is almost entirely cross-sectional and indicates whether countries with higher civil liberties show different geographic strike structures as opposed to whether a country's strike geography changes as its institutions evolve. ADM1 and week fixed effects cannot absorb the many ways that high-civil-liberty countries differ from low-civil-liberty countries, including levels of development, state capacity, democratic consolidation, and union density, so the moderation estimates should be interpreted as exploratory cross-national comparisons rather than causal estimates of institutional effects.
+
+Resolving these problems requires measures with substantially more temporal variation. One promising direction draws on the same event-data infrastructure used to construct the strike panel itself. GDELT's Global Knowledge Graph codes thematic content of news articles including media censorship events, and actor-type codes identify labor organizations, civil society groups, and government coercion events. From these it is possible, in principle, to construct country-month or even country-week proxies for information environment (volume and source diversity of media coverage, frequency of censorship-related events) and associational density (frequency of labor organization and civil society mentions). ACLED provides event-level data on state violence against protesters at weekly resolution across more than 150 countries, which could serve as a dynamic repression measure that varies within country over time. The advantage of these alternatives is precisely that they would generate within-country temporal variation, allowing the moderation analysis to be identified from changes in institutional context within a country rather than from cross-country comparisons, and making it possible to absorb country-level unobservables in a way that the current approach cannot.
+
+Freedom of expression and freedom of association are also positively correlated across countries, which limits the ability to identify their opposing effects when either enters the model in isolation. This is why the joint model is the appropriate specification, but even there the estimates are noisier than they would be if the two institutions were orthogonal. Direct measures of the underlying mechanisms, including media reach across subnational regions, local union density at the ADM1 level, or other measures of associational infrastructure, could provide sharper tests of the theoretical claims than annual national indices that bundle many distinct institutional features into a single score.
+
+## What Drives National Strike Waves?
+
+The two-way fixed effects design is conservative by construction: country-by-week fixed effects absorb all national common shocks, including the wave dynamics that the large national contagion effect implies are present and substantial. This conservatism is the right choice for the geographic contagion test, but it purchases identification at the cost of any information about what generates national waves in the first place. The current paper establishes that when national waves occur they produce large and spatially broad increases in strike probability, but what triggers them remains unexamined.
+
+A natural extension of this research is a country-week or country-quarter model of aggregate strike activity, asking what economic and political conditions predict entry into high-strike periods. The macroeconomic drivers of strike waves are well-theorized. Wage-price cycles, unexpected shifts in firm profitability, unemployment trajectories, and real wage growth have all been implicated in the historical wave literature, and these can be approximated from IMF and World Bank sources at quarterly frequency. The political opportunity literature points to government partisanship, election cycles, and austerity episodes as triggers for politically timed waves; here V-Dem and ParlGov provide the relevant variables. Union density and bargaining centralization from the OECD and ILO would capture the organizational infrastructure that converts economic grievances into coordinated action for at least a subset of countries. Contract cycle dynamics, whereby periods when many workers' agreements come up for renewal simultaneously create windows of elevated strike risk, could also be examined using ILO labor statistics where available, and GDELT-derived time series of labor negotiation events and wage-related news coverage could serve as leading indicators in countries where official statistics are sparse.
+
+## Strike Types and the Geography of Mobilization
+
+A third question concerns whether the contagion process looks the same across different types of strikes. The current analysis treats all CAMEO 143 events as equivalent, aggregating general strikes, industrial strikes, and political protest strikes into a single onset indicator. This may obscure substantial heterogeneity in how different kinds of labor action spread, and may explain at least part of why geographic and national channels behave as they do in the aggregate.
+
+The contrast between industry-specific and general strikes is theoretically sharp. Workers in particular industries are often geographically concentrated. Coal mines cluster in mining regions, garment factories in export processing zones, port workers in coastal cities, while public school teachers are distributed across every administrative region simultaneously. A wage dispute in a textile corridor may produce correlated strike activity in neighboring textile regions through genuine industry-network channels, including shared union federations, the same employer association, and synchronized contract cycles, while having no effect on non-textile regions in the same country. This pattern would look like geographic contagion in the raw data and would survive some national controls, even though the mechanism is sectoral rather than spatial. The current design cannot rule out that spatially clustered sectors account for the modest geographic residuals identified here. Disaggregating by industry would make this testable directly.
+
+General strikes, by contrast, are inherently national by their organizational logic. They are typically called by national labor federations or peak union bodies in response to national policy decisions such as austerity packages, labor law reform, pension cuts, or anti-privatization campaigns, and are designed to achieve simultaneous participation across all sectors and regions. The geographic structure of general strikes should therefore be strongly nationally homogeneous, not because spatial transmission fails but because the organizing logic is explicitly national. Political strikes targeting the government rather than a specific employer follow a similar logic and should similarly display national rather than geographic structure.
+
+Public-sector and private-sector strikes represent a related dimension. Public-sector workers in many countries face a single national employer, are subject to nationally-set wage scales and budget cycles, and are organized through federations that negotiate at the national level. A government announcement of public-sector pay restraint creates the same mobilization moment simultaneously across states and provinces in a way that a private-sector wage dispute in one factory does not. Private-sector strikes, where wages are negotiated at the plant or sector level, should show more spatial heterogeneity.
+
+Testing these distinctions is within reach using the existing LLM classification infrastructure. The URL and headline classification pipeline developed for event validation, which already identifies whether a GDELT event represents a genuine strike, can be extended to classify strike type using the same few-shot prompting approach applied to the same underlying article text and metadata. Classifying events as general or sectoral, public- or private-sector, industrial or political requires additional annotation effort and prompt engineering but no new architectural decisions. Industry classification from article text, covering sectors such as mining, transport, education, healthcare, and manufacturing, would permit a more granular decomposition.
+
+
+# Conclusion
+
+This paper set out to ask whether strikes spread geographically, whether seeing a neighbor strike makes you more likely to strike. The answer, at least at the subnational level with weekly data from 181 countries, is no. The spatial clustering of strikes is real, but it reflects the national structure of strike waves. When a country is in a period of labor mobilization, all its regions tend to strike together. Geography per se does not amplify or structure this transmission.
+
+The positive finding — large, robust national contagion effects — opens an agenda for understanding what drives national strike waves. Why do some countries experience synchronized national waves while others see more localized episodes? What roles do national union federations, political cycles, and macroeconomic shocks play in generating and sustaining national waves? These questions are not answerable with the current design, which absorbs national wave dynamics into fixed effects, but they suggest productive directions for future research.
+
+```{=tex}
+\newpage
+```
+
+# References
+
+```{=latex}
+\setlength{\parindent}{-0.2in}
+\setlength{\leftskip}{0.2in}
+\setlength{\parskip}{8pt}
+\noindent
+```
+
+::: {#refs}
+:::
+
+```{=latex}
+\clearpage
+\FloatBarrier
+\appendix
+\renewcommand{\thetable}{A\arabic{table}}
+\renewcommand{\thefigure}{A\arabic{figure}}
+\setcounter{table}{0}
+\setcounter{figure}{0}
+\setlength{\parindent}{0.5in}
+\setlength{\leftskip}{0in}
+\setlength{\parskip}{0em}
+```
+
+# Appendix
+
+## Summary Statistics
+
+```{r}
+#| label: tbl-sumstats
+#| tbl-cap: "Summary statistics for the analysis sample"
+#| echo: false
+
+kable(tbl_sumstats, booktabs = TRUE)
+```
+
+## Alternative Specifications
+
+**Table A2** replicates the baseline under two alternative specifications: two-way clustering of standard errors at both the ADM1 and country-week levels, and logistic regression. Results are qualitatively identical across all three. The null geographic neighbor effect is not an artifact of the standard error choice or the linear probability model.
+
+```{r}
+#| tbl-cap: "Robustness: alternative standard errors and estimator"
+#| tbl-pos: "H"
+#| echo: false
+#| output: asis
+
+etable(
+  tbl_robust_se,
+  dict        = coef_dict,
+  signif.code = c("*" = .1, "**" = .05, "***" = .01),
+  fitstat     = ~ n + r2,
+  style.tex   = etable_style,
+  tex         = TRUE
+)
+```
+
+## Validated-Location Robustness
+
+The following tables replicate the main results restricting to strike events where the ADM1 geocode was confirmed correct by the LLM-based geo-validation step (`geo_quality == "validated"`). Unvalidated strike weeks are recoded as non-onset weeks, keeping the balanced panel intact. The validated sample has an onset rate of approximately 0.87% compared to 1.4% in the full sample. **Table A3** compares the baseline model across samples. **Table A4** compares the decomposition.
+
+```{r}
+#| tbl-cap: "Validated-location robustness: baseline specification"
+#| tbl-pos: "H"
+#| echo: false
+#| output: asis
+
+etable(
+  tbl_val_baseline,
+  dict        = coef_dict,
+  signif.code = c("*" = .1, "**" = .05, "***" = .01),
+  fitstat     = ~ n + r2,
+  style.tex   = etable_style,
+  tex         = TRUE
+)
+```
+
+```{r}
+#| tbl-cap: "Validated-location robustness: national vs. neighborhood decomposition"
+#| tbl-pos: "H"
+#| echo: false
+#| output: asis
+
+etable(
+  tbl_val_decomp,
+  dict        = coef_dict,
+  signif.code = c("*" = .1, "**" = .05, "***" = .01),
+  fitstat     = ~ n + r2,
+  style.tex   = etable_style,
+  tex         = TRUE
+)
+```
+
+
+```{=latex}
+\clearpage
+```
+
+## Cross-Border Diffusion
+
+**Table A5** tests whether strikes spread across international borders. The sample is restricted to ADM1 units with at least one cross-border neighbor (~95 units). Columns (1)–(2) include only the cross-border exposure variable; columns (3)–(4) add within-country neighbor exposure jointly. Cross-border effects are null across all specifications.
+
+```{r}
+#| tbl-cap: "Cross-border diffusion"
+#| tbl-pos: "H"
+#| echo: false
+#| output: asis
+
+etable(
+  tbl_cross_border,
+  dict        = coef_dict,
+  signif.code = c("*" = .1, "**" = .05, "***" = .01),
+  fitstat     = ~ n + r2,
+  style.tex   = etable_style,
+  tex         = TRUE
+)
+```
