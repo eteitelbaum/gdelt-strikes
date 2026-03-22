@@ -1,0 +1,56 @@
+---
+title: "Forecasting Strikes with GDELT Event Data"
+subtitle: "Extended Abstract for the NYU Data Science Frontiers Workshop"
+author: "Emmanuel Teitelbaum\\thanks{Associate Professor of Political Science and International Affairs, George Washington University, \\texttt{ejt@gwu.edu}}"
+date: today
+format: pdf
+bibliography: strike-forecasting.bib  
+---
+
+## Overview
+
+The prediction of labor strikes has a distinguished history in the social sciences, beginning with Hicks's [-@hicks1963] foundational analysis of industrial disputes and continuing through pioneering econometric approaches to strike forecasting [@ashenfelter1969; @hibbs1976] and influential studies of business cycle effects on strike frequency and duration [@kennan1985; @kennan1987; @rees1952]. This tradition extended into asymmetric information models linking firm characteristics to strike incidence [@card1990] and demonstrated the predictive value of media attention for labor conflicts [@flynn2000].
+
+However, systematic forecasting of labor unrest has largely receded from mainstream social science research, perhaps due to earlier data limitations and a broader disciplinary shift away from predictive modeling toward causal identification. Meanwhile, contemporary computational approaches have successfully applied modern event-based forecasting methods to predict civil unrest and protest events [@ning2016; @tuke2020] and various forms of political violence and conflict [@mueller2022], yet these advances have not been systematically applied to labor strikes at scale. This represents a significant lacuna given strikes' continued importance for economic disruption, supply chain management, and political stability.
+
+This paper addresses this gap by reviving the tradition of labor conflict forecasting through modern data and methods. The analysis leverages the Global Database of Events, Language, and Tone (GDELT), a largely untapped resource that offers comprehensive, real-time global event data at unprecedented scale and granularity [@leetaru2013]. Employing cloud-based extraction and machine learning approaches, this study systematically applies event-based forecasting techniques to strike prediction, drawing on GDELT's rich temporal, spatial, and contextual information to advance the classic tradition of strike analysis for the contemporary era.
+
+## Methods
+
+**Data Engineering and Extraction.** This research employs modern data engineering approaches to extract and process GDELT strike events using Google BigQuery. This approach enabled processing of over 10 years of global event data (2015-2025) at subnational resolution, creating a dataset of 99,482 observations across multiple countries and regions (@fig-eda). The extraction pipeline identified strike events through GDELT's CAMEO event classification system, aggregating to weekly counts by ADM1 geographic regions to balance temporal resolution with statistical power. This BigQuery-based approach provides a replicable template for social scientists wishing to analyze strike data and represents a significant methodological advance over traditional data collection constraints.
+
+![Exploratory data analysis showing temporal patterns and distributions of strike events across regions and time periods.](../plots/eda-plots.png){#fig-eda width=85%}
+
+**Feature Engineering.** Drawing on theoretical insights from the business cycle literature on strike patterns and conflict forecasting, the analysis engineered features capturing multiple dimensions of labor conflict dynamics. Temporal dependencies were captured through lagged strike counts and rolling averages spanning 4 and 8 weeks to reflect the persistent and cyclical nature of labor disputes documented in classical studies. Media mobilization was operationalized through total news mentions and article counts, reflecting contemporary theories of information cascades and social mobilization that drive collective action. Actor network patterns were measured through indicators of government, labor, and civil society involvement, capturing the multi-actor dynamics that shape strike emergence and escalation. Finally, sentiment dynamics were incorporated through GDELT tone scores and their temporal lags to reflect the emotional and rhetorical context preceding labor conflicts.
+
+**Machine Learning Pipeline.** The analysis implemented a comprehensive model comparison framework testing Random Forest, XGBoost, LightGBM, and Linear Regression approaches with suitable hyperparameter optimization. Critically, the study employed temporal train-validation-test splits (80/10/10) to prevent data leakage and ensure realistic evaluation that mirrors actual deployment scenarios. This methodological approach represents an improvement over standard cross-validation approaches that are inappropriate for time series prediction, as temporal splits maintain chronological integrity and provide more realistic performance estimates for forecasting applications.
+
+## Preliminary Results 
+
+Model comparison across four algorithms revealed consistent performance differences, with XGBoost (RMSE = 1.87) outperforming LightGBM (RMSE = 1.92), Linear Regression (RMSE = 1.99), and Random Forest (RMSE = 2.65). While tree-based ensemble methods generally outperformed linear approaches, the relatively strong performance of Linear Regression suggests that the underlying relationships contain substantial linear components alongside the non-linear patterns captured by gradient boosting.
+
+The XGBoost model achieved exceptional predictive performance, demonstrating the substantial viability of reviving strike prediction through modern methods. The model explained over 92% of variance in weekly strike counts, representing a dramatic advance over traditional approaches constrained by data availability and computational limitations. This performance level suggests that systematic strike forecasting is not only feasible but can achieve accuracy suitable for practical policy and business applications.
+
+![Variable importance rankings from the XGBoost model, highlighting the predictive power of temporal features, media attention, and actor diversity measures.](../plots/feature-importance.png){#fig-importance width=85%}
+
+Variable importance analysis revealed patterns consistent with theoretical expectations from the business cycle literature while uncovering novel insights unavailable to earlier researchers (@fig-importance). Temporal features including lagged counts and rolling averages dominated predictive power, confirming classical findings about strike persistence and cyclical patterns. However, media attention variables also ranked highly in importance, supporting contemporary theories of information-driven mobilization that were impossible to test systematically before the availability of comprehensive event databases like GDELT. Actor diversity measures and sentiment indicators provided additional predictive signal, suggesting that GDELT's multidimensional event characterization captures theoretically relevant aspects of strike formation beyond simple occurrence patterns.
+
+![Model diagnostic plots including residuals analysis, fitted vs. actual values, and performance metrics across different strike count ranges.](../plots/model-diagnostics.png){#fig-diagnostics width=85%}
+
+Model diagnostics reveal strong overall performance with some informative limitations that point toward future enhancements (@fig-diagnostics). Predictions demonstrate good calibration across strike activity ranges, though residual analysis indicates mild heteroskedasticity for higher strike counts, suggesting potential benefits from specialized extreme value modeling approaches. Temporal analysis shows relatively stable performance over time, but systematic residual patterns indicate opportunities for improvement through incorporation of additional temporal features such as holiday effects, electoral cycles, and other institutional calendar events not yet included in the current specification (@fig-temporal).
+
+![Temporal performance analysis showing model accuracy over time and systematic patterns in prediction errors across different time periods.](../plots/temporal-performance-analysis.png){#fig-temporal width=85%}
+
+## Planned Enhancements and Future Directions
+
+Several key improvements are planned for the full research implementation. External data integration will merge the GDELT features with economic indicators including unemployment rates, GDP growth, and inflation measures, as well as climatic variables and political stability indices to provide broader contextual information beyond event-focused features. This approach follows insights from regional political economy research about how structural economic conditions shape labor mobilization capacity [@teitelbaum2007] and findings demonstrating that institutional factors such as regime type and political competition significantly moderate the relationship between economic shocks and strike activity [@robertson2011]. Ensemble methods will be implemented through stacked ensembles and Bayesian model averaging to improve prediction accuracy and provide uncertainty quantification essential for policy applications requiring confidence intervals.
+
+Spatial modeling represents another promising direction, incorporating spatial lag variables and distance-weighted spillover effects to capture regional contagion patterns in strike activity as has been done in conflict analysis [@brandt2022]. This development recognizes that labor disputes often cluster geographically due to shared economic conditions and information networks. Finally, temporal sophistication will be enhanced through integration of country-specific institutional calendars, seasonal decomposition techniques, and time-varying coefficient models to address systematic temporal patterns currently missing from the analysis.
+
+## Contribution and Implications
+
+This research makes several contributions to computational social science methodology and substantive labor research. Methodologically, this research demonstrates how modern data engineering and machine learning can revive classical research traditions previously constrained by data limitations. The BigQuery-based extraction approach provides a replicable framework for social scientists working with large public datasets and represents a significant advance in computational social science infrastructure.
+
+Substantively, the results suggest that systematic strike forecasting is feasible at accuracy levels suitable for practical applications, potentially supporting early warning systems for economic disruption and political instability. The subnational geographic resolution enables targeted monitoring while maintaining global coverage, addressing policy needs for both local and international stakeholders. The substantial predictive performance achieved suggests that event data approaches can capture theoretically relevant patterns in collective action that were previously difficult to observe systematically.
+
+## References

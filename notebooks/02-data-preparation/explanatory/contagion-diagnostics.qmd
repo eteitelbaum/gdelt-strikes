@@ -21,6 +21,7 @@ library(lubridate)
 library(arrow)
 library(sf)
 library(scales)
+library(patchwork)
 library(here)
 
 conflicted::conflicts_prefer(dplyr::filter)
@@ -61,8 +62,10 @@ panel |>
   geom_smooth(method = "loess", span = 0.15, se = FALSE,
               color = "firebrick", linewidth = 0.8) +
   labs(
-    title = "Weekly ADM1 strike onsets (global)",
-    x = NULL, y = "ADM1 units with ≥1 strike"
+    title = "Weekly Strike Prevalence (Global)",
+    subtitle = "Regions with more than one strike",
+    x = NULL, y = "Number of ADM1 regions",
+    caption  = "Strike data derived from GDELT"
   )
 ```
 
@@ -125,13 +128,13 @@ ggplot(adm1_rates, aes(onset_rate)) +
 
 ## 4. Neighbor strike exposure
 
-Distribution of the preregistered treatment variable
+Distribution of the main treatment variable
 (`neighbor_strike_within_t1_t2`).
 
 ```{r}
-#| label: exposure-dist
+#| label: exposure-panel
 
-panel |>
+p_exposure <- panel |>
   filter(!is.na(neighbor_strike_within_t1_t2)) |>
   count(neighbor_strike_within_t1_t2) |>
   mutate(
@@ -140,37 +143,37 @@ panel |>
   ) |>
   ggplot(aes(label, pct)) +
   geom_col(fill = "steelblue") +
-  scale_y_continuous(labels = percent) +
+  geom_text(aes(label = percent(pct, accuracy = 0.1)), vjust = -0.4, size = 4) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
   labs(
-    title = "Neighbor strike exposure (within-country, t-1 to t-2)",
+    title = "(a) Distribution of neighbor exposure",
     x = NULL, y = "Share of ADM1-weeks"
   )
-```
 
-```{r}
-#| label: exposure-by-outcome
-
-# Key descriptive: strike rate conditional on neighbor exposure
-panel |>
+p_onset <- panel |>
   filter(!is.na(neighbor_strike_within_t1_t2)) |>
   group_by(neighbor_strike_within_t1_t2) |>
   summarize(
-    n            = n(),
-    strike_rate  = mean(strike_onset),
-    .groups      = "drop"
+    strike_rate = mean(strike_onset),
+    .groups     = "drop"
   ) |>
   mutate(
-    label       = c("No neighbor strike", "Neighbor strike"),
-    pct         = percent(strike_rate, accuracy = 0.1)
+    label = c("No neighbor strike", "Neighbor strike"),
+    pct   = percent(strike_rate, accuracy = 0.1)
   ) |>
   ggplot(aes(label, strike_rate)) +
   geom_col(fill = c("steelblue", "firebrick")) +
   geom_text(aes(label = pct), vjust = -0.4, size = 4) +
   scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
   labs(
-    title = "Strike onset rate by neighbor exposure",
-    subtitle = "Raw (unconditional) association",
+    title = "(b) Strike onset rate by neighbor exposure",
     x = NULL, y = "Strike onset rate"
+  )
+
+p_exposure + p_onset +
+  plot_annotation(
+    title = "Neighbor Strike Exposure and Its Raw Association with Strike Onset",
+    caption  = "Strike data derived from GDELT"
   )
 ```
 
