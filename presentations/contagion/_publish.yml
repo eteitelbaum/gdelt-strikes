@@ -1,0 +1,4 @@
+- source: contagion-presi.qmd
+  quarto-pub:
+    - id: 51dcc645-84f2-49bc-b122-5ffc1d89f3d3
+      url: https://eteitelbaum.quarto.pub/the-spatial-diffusion-of-labor-strikes
