@@ -1,0 +1,141 @@
+---
+# Archived validation slides — require url_validation_coded.csv
+# Original location: papers/nyu-sds-conf/url_validation_coded.csv
+# These were removed from nyu-presi.qmd pending recovery of the hand-coded validation sample.
+---
+
+## Data quality validation
+
+```{r}
+#| label: validation-plot
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-align: center
+
+# Load coded results
+url_coded <- read_csv("url_validation_coded.csv")
+
+# Calculate precision by stage
+validation_summary <- url_coded |>
+  group_by(stage) |>
+  summarise(
+    n_urls = n(),
+    n_relevant = sum(is_relevant),
+    precision = round(mean(is_relevant) * 100, 1)
+  ) |>
+  mutate(
+    stage_label = case_when(
+      stage == "1_ADM1" ~ "ADM1 filter",
+      stage == "2_HighConf" ~ "+ High-confidence",
+      stage == "3_STRIKE" ~ "+ STRIKE theme"
+    ),
+    stage_order = case_when(
+      stage == "1_ADM1" ~ 1,
+      stage == "2_HighConf" ~ 2,
+      stage == "3_STRIKE" ~ 3
+    )
+  ) |>
+  arrange(stage_order)
+
+# Create bar chart
+ggplot(validation_summary, aes(x = reorder(stage_label, stage_order), y = precision)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_text(aes(label = paste0(precision, "%")), vjust = -0.5, size = 4) +
+  labs(
+    title = "Filtering Effectiveness",
+    subtitle = "Percentage of URLs actually about strikes at each filtering stage",
+    x = "Filter Stage",
+    y = "Precision (% Strike-Relevant URLs)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank()
+  ) +
+  ylim(0, max(validation_summary$precision) * 1.1)
+```
+
+## Examples: Definite strikes {.smaller}
+
+```{r}
+#| label: definite-strikes
+#| echo: false
+#| message: false
+#| warning: false
+
+# Load coded results and get definite strikes
+url_coded <- read_csv("url_validation_coded.csv")
+
+strikes <- url_coded |>
+  filter(is_relevant == 1) |>
+  slice(2:5) |>  # Skip Portugal trains, get more obvious strikes
+  select(url, notes)
+
+# Display as simple table
+knitr::kable(strikes,
+             col.names = c("URL", "Description"),
+             format = "html") |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+## Examples: Definite non-strikes {.smaller}
+
+```{r}
+#| label: definite-non-strikes
+#| echo: false
+#| message: false
+#| warning: false
+
+# Get definite non-strikes
+non_strikes <- url_coded |>
+  filter(is_relevant == 0) |>
+  head(4) |>
+  select(url, notes)
+
+# Display as simple table
+knitr::kable(non_strikes,
+             col.names = c("URL", "Description"),
+             format = "html") |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "condensed"))
+```
+
+## Examples: Borderline cases {.smaller}
+
+```{r}
+#| label: borderline-cases
+#| echo: false
+#| message: false
+#| warning: false
+
+# Get some borderline cases (mix of relevant/not relevant)
+# Include Portugal train example (less obvious strike) + two from STRIKE stage
+portugal_train <- url_coded |>
+  filter(is_relevant == 1) |>
+  slice(1) |>
+  select(url, notes)
+
+strike_stage_examples <- url_coded |>
+  filter(stage == "3_STRIKE") |>  # After STRIKE filter
+  arrange(desc(is_relevant)) |>   # Put relevant first
+  slice(1:2) |>  # Get first two examples
+  select(url, notes)
+
+borderline <- bind_rows(strike_stage_examples, portugal_train) |>
+  mutate(
+    # Break up the long Mexican URL for better readability
+    url = case_when(
+      str_detect(url, "noticias.terra.es") ~
+        "https://noticias.terra.es/mundo/latinoamerica/\nmaestros-marchan-en-la-ciudad-de-mexico\n-en-contra-de-la-reforma-educativa",
+      TRUE ~ url
+    )
+  )
+
+# Display as simple table
+knitr::kable(borderline,
+             col.names = c("URL", "Description"),
+             format = "html") |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "condensed"))
+```

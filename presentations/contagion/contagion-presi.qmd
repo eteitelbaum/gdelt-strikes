@@ -1,0 +1,283 @@
+---
+title: "The Spatial Diffusion of Labor Strikes"
+subtitle: "Evidence from Global Subnational Event Data"
+author: "Emmanuel Teitelbaum"
+institute: "George Washington University"
+date: today
+date-format: long
+footer: "APSA Labor Group CPLW · March 2026"
+logo: images/esia-logo.png
+format:
+  revealjs:
+    theme: [simple, light-gw.scss]
+    transition: fade
+    slide-number: true
+    chalkboard: true
+    width: 1280
+    height: 720
+execute:
+  echo: false
+  message: false
+  warning: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(here)
+library(tidyverse)
+library(fixest)
+library(modelsummary)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+source(here("papers/contagion/helpers/figures.R"))
+source(here("papers/contagion/helpers/tables.R"))
+
+# Shared modelsummary options
+ms_stars  <- c("*" = 0.1, "**" = 0.05, "***" = 0.01)
+ms_gof    <- tribble(
+  ~raw,          ~clean,   ~fmt,
+  "nobs",        "N",       0,
+  "r.squared",   "R²",      3
+)
+```
+
+# The Puzzle
+
+## Strike waves are real...
+
+```{r}
+#| label: fig-puzzle
+#| fig-width: 10
+#| fig-height: 4.5
+
+fig_1
+```
+
+::: {.fragment}
+Regions with a striking neighbor are **3.5× more likely** to strike. Is this geographic contagion — or just national common shocks?
+:::
+
+# Theory
+
+## Two mechanisms, one pattern {.smaller}
+
+:::: {.columns}
+
+::: {.column width="48%"}
+**Geographic contagion**
+
+ Workers observe a neighboring region striking and update beliefs about the feasibility and costs of collective action, lowering the threshold for action nearby. 
+
+<br>
+
+*Relational mechanism: transmission through direct ties.*
+:::
+
+::: {.column width="4%"}
+:::
+
+::: {.column width="48%"}
+**National contagion**
+
+Union federations, national policy, and media simultaneously shift strike propensity across all regions — producing clustering without any direct transmission.
+
+<br>
+
+*Non-relational mechanism: independent response to common stimuli.*
+:::
+
+::::
+
+<br>
+
+::: {.fragment}
+**Both produce identical observable patterns.** Historical (e.g. Shorter & Tilly 1974; Franzosi 1995) and economic (e.g. Ashenfelter & Johnson 1969; Hibbs 1976) accounts both lean national, but no prior study has identified the two mechanisms causally at subnational scale.        
+:::
+
+# Data
+
+## Filtering raw records to validated strikes
+
+```{r}
+#| label: tbl-pipeline
+
+pipeline <- tibble(
+  Step = c(
+    "BigQuery download",
+    "Geographic filter",
+    "High-confidence filter",
+    "Keyword theme filter",
+    "LLM content classifier"
+  ),
+  Description = c(
+    "CAMEO code 143, valid coordinates",
+    "Valid subnational region code assigned",
+    "At least one high-confidence mention",
+    "Article tagged \"STRIKE\" in topic metadata",
+    "Article describes a labor strike (GPT-4o mini)"
+  ),
+  Records = c("492,500", "328,982", "134,141", "30,899", "11,503")
+)
+
+kable(pipeline, align = c("l", "l", "r")) |>
+  kable_styling(font_size = 22, full_width = TRUE) |>
+  row_spec(5, bold = TRUE)
+```
+
+## Global coverage
+
+```{r}
+#| label: fig-map
+#| fig-width: 10
+#| fig-height: 4.5
+
+fig_2
+```
+
+::: {style="font-size: 0.75em; color: grey;"}
+568 ADM1 regions, 74 countries, 2015–2025. Clustering reflects genuine activity and GDELT's stronger coverage of English-language and romanized-script sources.
+:::
+
+# Identification
+
+## Baseline
+
+**Test for geographic contagion**
+
+$$Y_{it} = \beta \cdot \text{NeighborStrike}_{i,t-1:t-2} + \alpha_i + \gamma_{c \times t} + \varepsilon_{it}$$
+
+Country-by-week FEs $(\gamma_{c \times t})$ absorb *every* national-level shock. (No need to specify which factors matter.)
+
+<br>
+
+::: {style="font-size: 0.8em; color: grey; margin-top: 0.5em;"}
+Estimated with LPM via `feols`; standard errors clustered at ADM1 level.
+:::
+
+## Decomposition 
+
+**Test for separate national and geographic channels**
+
+$$\begin{aligned}
+Y_{it} =\, &\beta_1 \cdot \text{NeighborStrike}_{i,t-1:t-2} + \beta_2 \cdot \text{CountryShare}_{i,t-1:t-2} \\
+            &+ \alpha_i + \gamma_t + \varepsilon_{it}
+\end{aligned}$$ 
+
+Replaces country×week FE with an explicit measure of national strike activity. Estimates both channels simultaneously.
+
+<br>
+
+::: {style="font-size: 0.8em; color: grey; margin-top: 0.5em;"}
+Estimated with LPM via `feols`; standard errors clustered at ADM1 level.
+:::
+
+# Results
+
+## No evidence of geographic contagion
+
+```{r}
+#| label: tbl-baseline
+
+modelsummary(
+  tbl_baseline,
+  coef_map = c(
+    "neighbor_strike_within_t1_t2" = "Neighbor strike (t−1, t−2)",
+    "neighbor_strike_within_t1_t1" = "Neighbor strike (t−1 only)",
+    "neighbor_strike_within_t2_t2" = "Neighbor strike (t−2 only)"
+  ),
+  gof_map  = ms_gof,
+  stars    = ms_stars,
+  col.names = c(" ", "(1) Pooled", "(2) t−1", "(3) t−2"),
+  output   = "kableExtra"
+) |>
+  kable_styling(font_size = 20, full_width = FALSE, position = "center") |>
+  add_header_above(c(" " = 1, "Country × Week FEs" = 3)) |>
+  footnote(general = "ADM1 fixed effects included in all models. SEs clustered at ADM1 level.",
+           footnote_as_chunk = TRUE, general_title = "")
+```
+
+::: {.fragment}
+Raw 3.5× neighbor association **fully disappears** once country-by-week FEs are added.
+:::
+
+## National contagion dominates geographic effects
+
+```{r}
+#| label: tbl-decomp
+
+modelsummary(
+  tbl_decomposition,
+  coef_map = c(
+    "country_share_t1_t2"          = "Country share (t−1, t−2)",
+    "neighbor_strike_within_t1_t2" = "Neighbor strike (t−1, t−2)"
+  ),
+  gof_map  = ms_gof,
+  stars    = ms_stars,
+  col.names = c(" ", "(1) Country", "(2) Neighbor", "(3) Both"),
+  output   = "kableExtra"
+) |>
+  kable_styling(font_size = 20, full_width = FALSE, position = "center") |>
+  add_header_above(c(" " = 1, "Country + Week FEs" = 3)) |>
+  footnote(general = "ADM1 and week fixed effects in all models. SEs clustered at ADM1 level.",
+           footnote_as_chunk = TRUE, general_title = "")
+```
+
+::: {.fragment}
+1 SD increase in country share **nearly doubles** strike probability. National contagion explains **63× more** within-unit variance than geographic exposure.
+:::
+
+# Conclusion
+
+## Strike contagion is national, not geographic {.smaller}
+
+**Three robust findings:**
+
+1. The raw geographic clustering is real but does not survive a design that absorbs national common shocks
+
+2. National contagion is large: when strikes rise elsewhere in the country, local strike probability rises substantially
+
+3. Institutions shape the *spatial form* of national waves (freedom of expression flattens geographic structure; freedom of association reinforces it)
+
+<br>
+
+**Broader implication:** Geographic proximity is a marker of shared national exposure rather than a conduit of transmission. Future research should focus on what triggers national synchronization, e.g. economic, political, and institutional factors that generate country-wide waves.
+
+# Appendix {visibility="uncounted"}
+
+## Institutions shape the geography of national waves {visibility="uncounted"}
+
+```{r}
+#| label: tbl-moderation
+
+modelsummary(
+  tbl_moderation_ext,
+  coef_map = c(
+    "country_share_t1_t2"                     = "Country share",
+    "neighbor_strike_within_t1_t2"            = "Neighbor strike",
+    "neighbor_strike_within_t1_t2:freexp_z"   = "Neighbor × Expression",
+    "neighbor_strike_within_t1_t2:frassoc_z"  = "Neighbor × Association",
+    "neighbor_strike_within_t1_t2:repression_z" = "Neighbor × Repression",
+    "country_share_t1_t2:freexp_z"            = "Country share × Expression",
+    "country_share_t1_t2:frassoc_z"           = "Country share × Association",
+    "country_share_t1_t2:repression_z"        = "Country share × Repression"
+  ),
+  gof_map  = ms_gof,
+  stars    = ms_stars,
+  col.names = c(" ", "(1) Expression", "(2) Association", "(3) Repression", "(4) Joint"),
+  output   = "kableExtra"
+) |>
+  kable_styling(font_size = 16, full_width = FALSE, position = "center") |>
+  footnote(general = "ADM1 and week FEs. All V-Dem indicators standardized. SEs clustered at ADM1 level.",
+           footnote_as_chunk = TRUE, general_title = "")
+```
+
+## Robustness {visibility="uncounted"}
+
+- **Bias-corrected logit** (`alpaca`): substantive conclusions unchanged
+- **Two-way clustering** (ADM1 + country-week): null geographic result holds
+- **Validated-location subsample** (confirmed ADM1 geocodes only): null geographic \& large national both replicate
+- **Cross-border neighbors**: null across all specifications; strike contagion bounded by national frameworks
