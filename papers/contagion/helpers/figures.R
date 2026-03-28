@@ -7,6 +7,7 @@ library(arrow)
 library(sf)
 library(scales)
 library(patchwork)
+library(rnaturalearth)
 library(here)
 
 conflicted::conflicts_prefer(dplyr::filter)
@@ -52,12 +53,11 @@ map_data <- adm1_sf |>
   left_join(strike_counts, by = c("GID_1" = "gid_1")) |>
   mutate(n_onset_log = log1p(n_onset))
 
-fig_coverage_map <- ggplot(map_data) +
-  geom_sf(aes(fill = n_onset_log), linewidth = 0.05, color = "white") +
-  geom_sf(
-    data = filter(map_data, is.na(n_onset)),
-    fill = "#d9d9d9", linewidth = 0.05, color = "white"
-  ) +
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+fig_coverage_map <- ggplot() +
+  geom_sf(data = world, fill = "#d9d9d9", color = "#b0b0b0", linewidth = 0.1) +
+  geom_sf(data = map_data, aes(fill = n_onset_log), linewidth = 0.05, color = "white") +
   scale_fill_gradient(
     low      = "#c6dbef",
     high     = "#08306b",
