@@ -39,9 +39,10 @@ source(here("papers/contagion/helpers/tables.R"))
 # Shared modelsummary options
 ms_stars  <- c("*" = 0.1, "**" = 0.05, "***" = 0.01)
 ms_gof    <- tribble(
-  ~raw,          ~clean,   ~fmt,
-  "nobs",        "N",       0,
-  "r.squared",   "R²",      3
+  ~raw,          ~clean,      ~fmt,
+  "nobs",        "N",          0,
+  "r.squared",   "R²",         3,
+  "r2.within",   "Within R²",  3
 )
 ```
 
@@ -227,7 +228,7 @@ modelsummary(
 ```
 
 ::: {.fragment}
-1 SD increase in country share **nearly doubles** strike probability. National contagion explains **63× more** within-unit variance than geographic exposure.
+1 SD increase in country share **more than doubles** strike probability. National contagion explains **63× more** within-unit variance than geographic exposure.
 :::
 
 # Conclusion
