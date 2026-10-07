@@ -48,3 +48,6 @@ tools/adm1_crosswalk/corrections_batch_meta.json
 # Claude session files
 .claude/
 logs/
+
+# Obsidian vault settings
+.obsidian/
