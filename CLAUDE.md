@@ -187,6 +187,7 @@ gdelt-strikes/
 │   ├── methods-fe-identification.md        # Citations for TWFE, LPM, clustering
 │   ├── gdelt-data-citations.md             # GDELT validation literature
 │   ├── gdelt-geolocation-reliability.md    # Geolocation reliability discussion
+│   ├── gdelt-country-codes.md              # FIPS → ISO3 mapping and pitfalls
 │   ├── contagion-preliminary-findings.md   # Early results summary
 │   ├── identification-strategy.md          # Identification narrative
 │   ├── results-presentation.md             # Results write-up notes
