@@ -182,7 +182,7 @@ gdelt-strikes/
 ├── helpers/
 │   ├── helpers.R                           # Model evaluation utilities (Paper 1)
 │   └── spatial_helpers.R
-├── notes/                                  # Literature review and methods notes
+├── notes/                                  # Symlink -> ../project-notes/gdelt-strikes (private repo; gitignored)
 │   ├── theory-contagion.md                 # Strike contagion literature (6 strands)
 │   ├── methods-fe-identification.md        # Citations for TWFE, LPM, clustering
 │   ├── gdelt-data-citations.md             # GDELT validation literature

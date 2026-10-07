@@ -51,3 +51,9 @@ logs/
 
 # Obsidian vault settings
 .obsidian/
+
+# Private notes — real files live in the private repo eteitelbaum/project-notes,
+# surfaced here as a symlink (notes -> ../project-notes/gdelt-strikes).
+# No trailing slash: `notes/` matches only real directories and would let the
+# symlink leak into git status. `/notes` matches the symlink itself.
+/notes
